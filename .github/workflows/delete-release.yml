@@ -1,0 +1,69 @@
+name: Delete Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to delete, with or without leading v. Example: 0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: delete-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  delete:
+    name: Delete release and tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Delete GitHub Release and tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${INPUT_VERSION#v}"
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid SemVer version: ${INPUT_VERSION}" >&2
+            exit 2
+          fi
+
+          tag="v${version}"
+          release_deleted="false"
+          tag_deleted="false"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Deleting GitHub Release: ${tag}"
+            gh release delete "$tag" --yes
+            release_deleted="true"
+          else
+            echo "GitHub Release does not exist: ${tag}"
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Deleting git tag: ${tag}"
+            git push --delete origin "$tag"
+            tag_deleted="true"
+          else
+            echo "Git tag does not exist: ${tag}"
+          fi
+
+          {
+            echo "## Delete Release"
+            echo ""
+            echo "- Version: ${version}"
+            echo "- Tag: ${tag}"
+            echo "- Release deleted: ${release_deleted}"
+            echo "- Tag deleted: ${tag_deleted}"
+          } >> "$GITHUB_STEP_SUMMARY"

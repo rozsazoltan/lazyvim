@@ -130,7 +130,20 @@ The first run creates the selected portable home, installs missing system depend
 
 ### Upgrade
 
-Install a newer release by replacing the `lazyvim` executable. Your LazyVim config, plugins, state, and cache stay in the selected portable home unless you remove or change that directory.
+Update the launcher executable in place:
+
+```sh
+lazyvim self-update
+```
+
+To install a specific release instead of the latest one:
+
+```sh
+lazyvim self-update 0.1.4
+lazyvim self-update --version 0.1.4
+```
+
+On Windows, the downloaded executable is scheduled to replace the running launcher after the current process exits. On Linux and macOS, the executable is replaced immediately. Your LazyVim config, plugins, state, and cache stay in the selected portable home unless you remove or change that directory.
 
 To update LazyVim plugins after upgrading the launcher:
 
@@ -167,6 +180,7 @@ lazyvim clean     # remove unused plugins
 lazyvim install-nvim   # install Neovim into the selected portable home
 lazyvim install-tools  # install managed portable tools into the selected portable home
 lazyvim install-deps   # install system and managed dependencies
+lazyvim self-update    # update the lazyvim launcher executable
 ```
 
 These commands run lazy.nvim in headless mode and use the same portable home as normal editor sessions.

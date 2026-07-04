@@ -85,6 +85,7 @@ enum CliCommand {
     InstallNvim,
     InstallTools,
     InstallDeps,
+    SelfUpdate { version: Option<String>, yes: bool },
     Reset { yes: bool },
     Help,
     Version,
@@ -138,6 +139,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("lazyvim {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        CliCommand::SelfUpdate { version, yes } => self_update_command(version.as_deref(), yes),
         CliCommand::Reset { yes } => {
             let runtime =
                 prepare_runtime(home, portable_home, user_home, home_action, false, false)?;
@@ -174,7 +176,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 CliCommand::InstallNvim => install_neovim_command(&runtime),
                 CliCommand::InstallTools => install_tools_command(&runtime),
                 CliCommand::InstallDeps => install_deps_command(&runtime),
-                CliCommand::Help | CliCommand::Version | CliCommand::Reset { .. } => unreachable!(),
+                CliCommand::Help
+                | CliCommand::Version
+                | CliCommand::SelfUpdate { .. }
+                | CliCommand::Reset { .. } => unreachable!(),
             }
         }
     }
@@ -254,6 +259,7 @@ fn parse_cli(mut args: Vec<String>) -> Cli {
         Some("install-nvim") => CliCommand::InstallNvim,
         Some("install-tools") => CliCommand::InstallTools,
         Some("install-deps") => CliCommand::InstallDeps,
+        Some("self-update") | Some("self-upgrade") => parse_self_update_command(&args),
         Some("reset") => CliCommand::Reset {
             yes: args.iter().any(|arg| arg == "--yes" || arg == "-y"),
         },
@@ -269,6 +275,43 @@ fn parse_cli(mut args: Vec<String>) -> Cli {
         home_action,
         command,
     }
+}
+
+fn parse_self_update_command(args: &[String]) -> CliCommand {
+    let mut version = None;
+    let mut yes = false;
+    let mut index = 1;
+
+    while index < args.len() {
+        let arg = &args[index];
+
+        if arg == "--yes" || arg == "-y" {
+            yes = true;
+            index += 1;
+            continue;
+        }
+
+        if arg == "--version" {
+            if index + 1 < args.len() {
+                version = Some(args[index + 1].clone());
+            }
+            break;
+        }
+
+        if let Some(value) = arg.strip_prefix("--version=") {
+            version = Some(value.to_string());
+            index += 1;
+            continue;
+        }
+
+        if !arg.starts_with('-') && version.is_none() {
+            version = Some(arg.clone());
+        }
+
+        index += 1;
+    }
+
+    CliCommand::SelfUpdate { version, yes }
 }
 
 fn prepare_runtime(
@@ -2311,6 +2354,154 @@ Copy-Item -LiteralPath $tool.FullName -Destination $dest -Force
     }
 }
 
+fn self_update_command(
+    version: Option<&str>,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let current_exe = env::current_exe()?;
+    let asset = self_update_release_asset()?;
+    let url = self_update_release_url(version, asset);
+    let parent = current_exe
+        .parent()
+        .ok_or("could not resolve launcher executable directory")?;
+    let temp_exe = parent.join(format!(
+        ".lazyvim-self-update-{}-{}",
+        std::process::id(),
+        asset
+    ));
+
+    if !yes && should_prompt_for_home_switch() {
+        println!("Current executable: {}", current_exe.display());
+        println!("Update source:      {url}");
+        print!("Replace the current lazyvim executable? [y/N]: ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if !matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            return Err("aborted self-update".into());
+        }
+    }
+
+    if temp_exe.exists() {
+        fs::remove_file(&temp_exe)?;
+    }
+
+    println!("Downloading {url}");
+    if let Err(error) = download_file(&url, &temp_exe) {
+        let _ = fs::remove_file(&temp_exe);
+        return Err(error);
+    }
+
+    make_executable(&temp_exe)?;
+
+    if cfg!(windows) {
+        schedule_windows_self_update(&temp_exe, &current_exe)?;
+        println!(
+            "Downloaded update. The executable will be replaced after this process exits: {}",
+            current_exe.display()
+        );
+        return Ok(());
+    }
+
+    fs::rename(&temp_exe, &current_exe).map_err(|error| {
+        let _ = fs::remove_file(&temp_exe);
+        format!(
+            "failed to replace {} with downloaded update: {}",
+            current_exe.display(),
+            error
+        )
+    })?;
+
+    println!("Updated {}", current_exe.display());
+    Ok(())
+}
+
+fn self_update_release_asset() -> Result<&'static str, Box<dyn std::error::Error>> {
+    if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+        return Ok("lazyvim-windows-x86_64.exe");
+    }
+
+    if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+        return Ok("lazyvim-linux-x86_64");
+    }
+
+    if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+        return Ok("lazyvim-macos-x86_64");
+    }
+
+    if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        return Ok("lazyvim-macos-arm64");
+    }
+
+    Err("self-update is not supported on this platform".into())
+}
+
+fn self_update_release_url(version: Option<&str>, asset: &str) -> String {
+    let repository = env!("CARGO_PKG_REPOSITORY").trim_end_matches('/');
+
+    match version.map(normalize_release_tag) {
+        Some(tag) => format!("{repository}/releases/download/{tag}/{asset}"),
+        None => format!("{repository}/releases/latest/download/{asset}"),
+    }
+}
+
+fn normalize_release_tag(version: &str) -> String {
+    let version = version.trim();
+    if version.starts_with('v') {
+        version.to_string()
+    } else {
+        format!("v{version}")
+    }
+}
+
+fn schedule_windows_self_update(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !cfg!(windows) {
+        return Err(
+            "Windows self-update scheduling is only available on Windows".into(),
+        );
+    }
+
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$source = $env:LAZYVIM_UPDATE_SOURCE
+$destination = $env:LAZYVIM_UPDATE_DESTINATION
+$parentPid = [int]$env:LAZYVIM_UPDATE_PARENT_PID
+$deadline = (Get-Date).AddSeconds(30)
+
+while ((Get-Date) -lt $deadline) {
+    $process = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
+    if ($null -eq $process) {
+        break
+    }
+    Start-Sleep -Milliseconds 250
+}
+
+Move-Item -LiteralPath $source -Destination $destination -Force
+"#;
+
+    Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-WindowStyle")
+        .arg("Hidden")
+        .arg("-Command")
+        .arg(script)
+        .env("LAZYVIM_UPDATE_SOURCE", source)
+        .env("LAZYVIM_UPDATE_DESTINATION", destination)
+        .env("LAZYVIM_UPDATE_PARENT_PID", std::process::id().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    Ok(())
+}
+
 fn make_executable(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -2865,6 +3056,7 @@ fn print_help() {
     println!("  install-nvim  Install Neovim into the portable home");
     println!("  install-tools Install managed portable tools into the portable home");
     println!("  install-deps  Install system and managed LazyVim dependencies");
+    println!("  self-update   Replace the launcher with the latest release");
     println!("  reset      Delete the portable home directory; requires --yes");
     println!("  help       Print this help");
     println!();
@@ -2941,6 +3133,16 @@ mod tests {
         assert!(packages.contains(&"unzip"));
         assert!(!packages.contains(&"curl"));
         assert!(!packages.contains(&"curl-minimal"));
+    }
+
+    #[test]
+    fn normalize_release_tag_adds_v_prefix() {
+        assert_eq!(normalize_release_tag("0.1.4"), "v0.1.4");
+    }
+
+    #[test]
+    fn normalize_release_tag_keeps_existing_v_prefix() {
+        assert_eq!(normalize_release_tag("v0.1.4"), "v0.1.4");
     }
 
     #[test]

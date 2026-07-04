@@ -493,7 +493,7 @@ fn install_system_dependencies(missing: &[String]) -> Result<(), Box<dyn std::er
     }
 
     if cfg!(target_os = "linux") {
-        return install_linux_system_dependencies();
+        return install_linux_system_dependencies(missing);
     }
 
     Err(format!("automatic dependency installation is not supported on this platform; missing: {}", missing.join(", ")).into())
@@ -572,26 +572,84 @@ enum LinuxDistro {
     Unknown,
 }
 
-fn install_linux_system_dependencies() -> Result<(), Box<dyn std::error::Error>> {
+fn install_linux_system_dependencies(missing: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let distro = detect_linux_distro();
+    if distro == LinuxDistro::Unknown {
+        return Err("could not detect a supported Linux distribution for dependency installation".into());
+    }
+
+    let packages = linux_system_packages(distro, missing);
+    if packages.is_empty() {
+        return Ok(());
+    }
+
+    let package_list = packages.join(" ");
     let command = match distro {
-        LinuxDistro::Alpine => "apk add --no-cache git curl ca-certificates tar unzip gzip xz",
-        LinuxDistro::Debian => "apt-get update && apt-get install -y git curl ca-certificates tar unzip gzip xz-utils",
-        LinuxDistro::Arch => "pacman -Sy --noconfirm --needed git curl ca-certificates tar unzip gzip xz",
-        LinuxDistro::Fedora => "dnf install -y git curl ca-certificates tar unzip gzip xz",
-        LinuxDistro::AmazonLinux | LinuxDistro::Rhel => {
+        LinuxDistro::Alpine => format!("apk add --no-cache {package_list}"),
+        LinuxDistro::Debian => format!("apt-get update && apt-get install -y {package_list}"),
+        LinuxDistro::Arch => format!("pacman -Sy --noconfirm --needed {package_list}"),
+        LinuxDistro::Fedora | LinuxDistro::AmazonLinux | LinuxDistro::Rhel => {
             if command_available_without_path("dnf") {
-                "dnf install -y git curl ca-certificates tar unzip gzip xz"
+                format!("dnf install -y {package_list}")
             } else {
-                "yum install -y git curl ca-certificates tar unzip gzip xz"
+                let yum_packages = linux_system_packages_for_yum(distro, missing).join(" ");
+                format!("yum install -y {yum_packages}")
             }
         }
-        LinuxDistro::Unknown => {
-            return Err("could not detect a supported Linux distribution for dependency installation".into());
-        }
+        LinuxDistro::Unknown => unreachable!("unknown distro is handled above"),
     };
 
-    run_privileged_shell(command)
+    run_privileged_shell(&command)
+}
+
+fn linux_system_packages(distro: LinuxDistro, missing: &[String]) -> Vec<&'static str> {
+    let mut packages = Vec::new();
+
+    push_unique(&mut packages, "ca-certificates");
+    push_unique(&mut packages, "gzip");
+    push_unique(
+        &mut packages,
+        match distro {
+            LinuxDistro::Debian => "xz-utils",
+            _ => "xz",
+        },
+    );
+
+    for command in missing {
+        match command.as_str() {
+            "git" => push_unique(&mut packages, "git"),
+            "curl" => push_unique(
+                &mut packages,
+                match distro {
+                    LinuxDistro::AmazonLinux | LinuxDistro::Rhel => "curl-minimal",
+                    _ => "curl",
+                },
+            ),
+            "tar" => push_unique(&mut packages, "tar"),
+            "unzip" => push_unique(&mut packages, "unzip"),
+            _ => {}
+        }
+    }
+
+    packages
+}
+
+fn linux_system_packages_for_yum(distro: LinuxDistro, missing: &[String]) -> Vec<&'static str> {
+    let mut packages = linux_system_packages(distro, missing);
+
+    for package in &mut packages {
+        if *package == "curl-minimal" {
+            *package = "curl";
+        }
+    }
+
+    packages
+}
+
+fn push_unique(packages: &mut Vec<&'static str>, package: &'static str) {
+    if !packages.contains(&package) {
+        packages.push(package);
+    }
 }
 
 fn install_tree_sitter_from_system_package(path_value: &OsString) -> Result<(), Box<dyn std::error::Error>> {
@@ -2068,4 +2126,25 @@ mod tests {
 
         assert_eq!(string_args(args), vec![String::from("-O2"), String::from("parser.c")]);
     }
+
+    #[test]
+    fn linux_system_packages_does_not_install_curl_when_curl_is_not_missing_on_rhel() {
+        let missing = vec![String::from("git"), String::from("unzip")];
+        let packages = linux_system_packages(LinuxDistro::Rhel, &missing);
+
+        assert!(packages.contains(&"git"));
+        assert!(packages.contains(&"unzip"));
+        assert!(!packages.contains(&"curl"));
+        assert!(!packages.contains(&"curl-minimal"));
+    }
+
+    #[test]
+    fn linux_system_packages_uses_curl_minimal_on_amazon_linux_when_curl_is_missing() {
+        let missing = vec![String::from("curl")];
+        let packages = linux_system_packages(LinuxDistro::AmazonLinux, &missing);
+
+        assert!(packages.contains(&"curl-minimal"));
+        assert!(!packages.contains(&"curl"));
+    }
+
 }

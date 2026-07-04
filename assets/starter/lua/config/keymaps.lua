@@ -1,0 +1,2 @@
+-- Keymaps are automatically loaded before LazyVim starts.
+-- Add any custom keymaps here.

@@ -9,12 +9,13 @@ neovim_version="${5:-stable}"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pkg="${root}/dist/package/lazyvim-${version}-${platform}"
-out="${root}/dist/lazyvim-${version}-${platform}.tar.gz"
+out="${root}/dist/lazyvim-${platform}.tar.gz"
 
 rm -rf "$pkg" "$out"
 mkdir -p "$pkg"
 cp "${root}/target/${target}/release/lazyvim" "$pkg/lazyvim"
-cp "${root}/README-PORTABLE.md" "$pkg/README-PORTABLE.md"
+cp "${root}/README.md" "$pkg/README.md"
+cp "${root}/LICENSE" "$pkg/LICENSE"
 chmod +x "$pkg/lazyvim"
 
 if [[ "$bundle_neovim" == "true" ]]; then

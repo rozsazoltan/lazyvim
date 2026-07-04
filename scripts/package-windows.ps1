@@ -9,14 +9,15 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Resolve-Path "$PSScriptRoot\.."
 $Package = Join-Path $Root "dist\package\lazyvim-$Version-$Platform"
-$Out = Join-Path $Root "dist\lazyvim-$Version-$Platform.zip"
+$Out = Join-Path $Root "dist\lazyvim-$Platform.zip"
 
 Remove-Item -Recurse -Force $Package -ErrorAction SilentlyContinue
 Remove-Item -Force $Out -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $Package | Out-Null
 
 Copy-Item "$Root\target\$Target\release\lazyvim.exe" "$Package\lazyvim.exe"
-Copy-Item "$Root\README-PORTABLE.md" "$Package\README-PORTABLE.md"
+Copy-Item "$Root\README.md" "$Package\README.md"
+Copy-Item "$Root\LICENSE" "$Package\LICENSE"
 
 if ($BundleNeovim -eq "true") {
     $NvimAsset = "nvim-win64.zip"

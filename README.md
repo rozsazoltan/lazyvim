@@ -1,111 +1,237 @@
-# lazyvim
+# rozsazoltan/lazyvim
 
-Portable LazyVim launcher for Linux, Windows, and macOS.
+Portable LazyVim launcher for the truly lazy.
 
-This repository does not fork LazyVim or Neovim. It provides a small Rust launcher that starts Neovim with an isolated LazyVim profile. The launcher keeps config, plugins, Mason packages, state, and cache under a dedicated portable home directory instead of touching the user's normal Neovim setup.
+`rozsazoltan/lazyvim` gives you a portable LazyVim entry point that can be installed as a single executable and started from any project directory. It keeps the LazyVim configuration, plugins, Mason packages, state, and cache in one dedicated home directory instead of using your normal Neovim setup.
 
-Default portable home:
+LazyVim made even lazier: install one executable and start creating.
+
+- [How it works](#how-it-works)
+- [Get started](#get-started)
+  - [Install](#install)
+  - [First run](#first-run)
+  - [Upgrade](#upgrade)
+- [Usage](#usage)
+  - [Open projects and files](#open-projects-and-files)
+  - [Lazy commands](#lazy-commands)
+  - [Portable home](#portable-home)
+  - [Neovim resolution](#neovim-resolution)
+  - [Environment variables](#environment-variables)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+
+Read on to learn how the launcher isolates LazyVim, or jump straight to [Get started](#get-started) if you only want the install commands.
+
+## How it works
+
+This project is not a fork of LazyVim or Neovim. It is a small Rust launcher that starts Neovim with an isolated LazyVim profile.
+
+By default, everything is stored under:
 
 ```text
 ~/.lazyvim
 ```
 
-The launcher sets these environment variables before starting Neovim:
+The launcher prepares the portable directory on first run, writes the starter LazyVim config if it does not exist yet, then starts Neovim with dedicated XDG paths:
 
 ```text
-NVIM_APPNAME=lazyvim
-XDG_CONFIG_HOME=<home>/config
-XDG_DATA_HOME=<home>/data
-XDG_STATE_HOME=<home>/state
-XDG_CACHE_HOME=<home>/cache
-PATH=<home>/bin:<package>/nvim/bin:<package>/bin:$PATH
+~/.lazyvim/config/lazyvim   # LazyVim config
+~/.lazyvim/data/lazyvim     # plugins, lazy.nvim, Mason packages
+~/.lazyvim/state/lazyvim    # Neovim state
+~/.lazyvim/cache/lazyvim    # cache
+~/.lazyvim/bin              # optional local tools
 ```
 
-That means LazyVim is resolved from:
+That means you can use `lazyvim` without touching `~/.config/nvim` or your existing Neovim profile.
 
-```text
-~/.lazyvim/config/lazyvim/init.lua
+## Get started
+
+### Install
+
+Download the package for your platform from the latest GitHub Release, extract it, and place the `lazyvim` executable somewhere in your `PATH`.
+
+Linux x86_64:
+
+```sh
+mkdir -p ~/.local/bin
+tmp="$(mktemp -d)"
+curl -fL https://github.com/rozsazoltan/lazyvim/releases/latest/download/lazyvim-linux-x86_64.tar.gz -o "$tmp/lazyvim.tar.gz"
+tar -xzf "$tmp/lazyvim.tar.gz" -C "$tmp"
+install -m 755 "$tmp"/lazyvim-*/lazyvim ~/.local/bin/lazyvim
 ```
 
-and plugins are installed under:
+macOS Apple Silicon:
 
-```text
-~/.lazyvim/data/lazyvim/lazy
+```sh
+mkdir -p ~/.local/bin
+tmp="$(mktemp -d)"
+curl -fL https://github.com/rozsazoltan/lazyvim/releases/latest/download/lazyvim-macos-arm64.tar.gz -o "$tmp/lazyvim.tar.gz"
+tar -xzf "$tmp/lazyvim.tar.gz" -C "$tmp"
+install -m 755 "$tmp"/lazyvim-*/lazyvim ~/.local/bin/lazyvim
+```
+
+macOS Intel:
+
+```sh
+mkdir -p ~/.local/bin
+tmp="$(mktemp -d)"
+curl -fL https://github.com/rozsazoltan/lazyvim/releases/latest/download/lazyvim-macos-x86_64.tar.gz -o "$tmp/lazyvim.tar.gz"
+tar -xzf "$tmp/lazyvim.tar.gz" -C "$tmp"
+install -m 755 "$tmp"/lazyvim-*/lazyvim ~/.local/bin/lazyvim
+```
+
+Windows PowerShell:
+
+```powershell
+Invoke-WebRequest https://github.com/rozsazoltan/lazyvim/releases/latest/download/lazyvim-windows-x86_64.zip -OutFile lazyvim.zip
+Expand-Archive .\lazyvim.zip -DestinationPath .\lazyvim -Force
+```
+
+Then add the extracted directory to `PATH`, or move `lazyvim.exe` to a directory that is already in `PATH`.
+
+> [!IMPORTANT]
+> Release packages may include a bundled Neovim runtime depending on how the release was built. If Neovim is not bundled, `nvim` must be available from your system `PATH` or configured with `LAZYVIM_NVIM`.
+
+### First run
+
+Open any project directory and run:
+
+```sh
+lazyvim .
+```
+
+The first run creates the portable home and lets LazyVim/lazy.nvim install plugins into `~/.lazyvim`.
+
+### Upgrade
+
+Install a newer release by replacing the `lazyvim` executable. Your LazyVim config, plugins, state, and cache stay in `~/.lazyvim` unless you remove or change that directory.
+
+To update LazyVim plugins after upgrading the launcher:
+
+```sh
+lazyvim update
+```
+
+To restore plugins from the lockfile:
+
+```sh
+lazyvim restore
 ```
 
 ## Usage
 
-```bash
+### Open projects and files
+
+```sh
 lazyvim
 lazyvim .
 lazyvim src/main.rs
-lazyvim --home ~/.my-lazyvim
-lazyvim where
-lazyvim doctor
-lazyvim sync
-lazyvim restore
-lazyvim update
-lazyvim clean
+lazyvim -- README.md
 ```
 
-The current working directory is inherited, so running `lazyvim` from a project opens that project in the same way as terminal tools like `lazygit` or `lazydocker`.
+The current working directory is inherited, so `lazyvim` opens the directory you are already in, similar to terminal tools such as `lazygit` or `lazydocker`.
 
-## Portable packages
+### Lazy commands
 
-Release packages are intended to contain:
+```sh
+lazyvim sync      # install and sync plugins
+lazyvim restore   # restore plugins from the lockfile
+lazyvim update    # update plugins
+lazyvim clean     # remove unused plugins
+```
+
+These commands run Lazy.nvim in headless mode and use the same portable home as normal editor sessions.
+
+### Portable home
+
+The default portable home is:
 
 ```text
-lazyvim                 # or lazyvim.exe
-nvim/                   # optional bundled Neovim runtime
-README-PORTABLE.md
+~/.lazyvim
 ```
 
-The launcher resolves Neovim in this order:
+Use a different location for one command:
+
+```sh
+lazyvim --home ~/.work-lazyvim .
+```
+
+Or persist it with an environment variable:
+
+```sh
+LAZYVIM_HOME=~/.work-lazyvim lazyvim .
+```
+
+Print the resolved locations:
+
+```sh
+lazyvim where
+```
+
+Reset the portable home:
+
+```sh
+lazyvim reset --yes
+```
+
+> [!WARNING]
+> `reset --yes` deletes the selected portable home directory, including config, plugins, cache, state, Mason packages, and lock files stored there.
+
+### Neovim resolution
+
+The launcher looks for Neovim in this order:
 
 1. `LAZYVIM_NVIM`
-2. `<package>/nvim/bin/nvim` or `<package>/nvim/bin/nvim.exe`
-3. `<package>/bin/nvim` or `<package>/bin/nvim.exe`
-4. `~/.lazyvim/bin/nvim` or `~/.lazyvim/bin/nvim.exe`
+2. `nvim/bin/nvim` next to the launcher package
+3. `bin/nvim` next to the launcher package
+4. `~/.lazyvim/bin/nvim`
 5. `nvim` from `PATH`
 
-## Environment variables
+This lets release packages use bundled Neovim while still allowing advanced users to point to their own binary.
+
+### Environment variables
 
 | Variable | Description |
-| --- | --- |
-| `LAZYVIM_HOME` | Overrides the default portable home directory. |
-| `LAZYVIM_NVIM` | Points to a specific Neovim executable. |
-| `NVIM_APPNAME` | Set by the launcher to `lazyvim` unless already overwritten in code. |
+|---|---|
+| `LAZYVIM_HOME` | Overrides the default `~/.lazyvim` portable home. |
+| `LAZYVIM_NVIM` | Uses a specific Neovim executable. |
 
-## Release workflow
+The launcher sets these variables automatically before starting Neovim:
 
-The manual release workflow accepts a version input and a target branch input. It updates repository version files on `chore/release-{version}`, creates a pull request, squash-merges it into the selected target branch when there are changes, builds platform executables, and creates the GitHub Release only after all build jobs succeed.
+| Variable | Value |
+|---|---|
+| `NVIM_APPNAME` | `lazyvim` |
+| `XDG_CONFIG_HOME` | `$LAZYVIM_HOME/config` |
+| `XDG_DATA_HOME` | `$LAZYVIM_HOME/data` |
+| `XDG_STATE_HOME` | `$LAZYVIM_HOME/state` |
+| `XDG_CACHE_HOME` | `$LAZYVIM_HOME/cache` |
 
-Required repository settings:
+## Troubleshooting
 
-- GitHub Actions workflow permissions: read/write
-- Squash merge enabled
-- `GITHUB_TOKEN` must be allowed to create pull requests and write contents
+Run the built-in doctor command first:
 
-Run it from GitHub Actions:
-
-```text
-Actions -> Release -> Run workflow
+```sh
+lazyvim doctor
 ```
 
-Inputs:
+LazyVim plugins may need external developer tools depending on the enabled extras and the project you open. Common examples are Git, curl, ripgrep, fd, a C compiler, language runtimes, package managers, formatters, linters, and LSP servers.
 
-| Input | Example | Description |
-| --- | --- | --- |
-| `version` | `0.1.1` | SemVer version without leading `v`. |
-| `target_branch` | `master` | Branch to release from and squash-merge version updates into. |
-| `neovim_version` | `stable` | Neovim release tag to bundle, for example `stable`, `nightly`, or `v0.12.2`. |
-| `bundle_neovim` | `true` | Whether to download and include Neovim in the release package. |
-| `draft` | `false` | Whether to create the GitHub Release as a draft. |
-| `prerelease` | `false` | Whether to mark the GitHub Release as a prerelease. |
+If Neovim cannot be found, either install Neovim normally or point the launcher to a binary:
 
-## Local development
+```sh
+LAZYVIM_NVIM=/path/to/nvim lazyvim .
+```
 
-```bash
+If you want a completely fresh LazyVim profile:
+
+```sh
+lazyvim reset --yes
+lazyvim sync
+```
+
+## Contributing
+
+```sh
 cargo fmt
 cargo clippy --all-targets -- -D warnings
 cargo test
@@ -113,6 +239,12 @@ cargo run -- --version
 cargo run -- where
 ```
 
-## Notes
+Keep changes small and focused. User-facing behavior should stay portable by default and must not write into the user's normal Neovim config directories.
 
-This launcher isolates Neovim paths, but LazyVim plugins may still require external developer tools such as Git, curl, ripgrep, fd, compilers, language runtimes, or package managers depending on the enabled extras and project type.
+## License & Acknowledgments
+
+This project would not exist without [Neovim](https://github.com/neovim/neovim), [LazyVim](https://github.com/LazyVim/LazyVim), [lazy.nvim](https://github.com/folke/lazy.nvim), and their creators and contributors.
+
+It is open source and released under the [GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)](https://www.gnu.org/licenses/agpl-3.0.html).
+
+Copyright (C) 2020–present [Zoltán Rózsa](https://github.com/rozsazoltan)

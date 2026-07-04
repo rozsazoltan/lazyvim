@@ -2354,10 +2354,7 @@ Copy-Item -LiteralPath $tool.FullName -Destination $dest -Force
     }
 }
 
-fn self_update_command(
-    version: Option<&str>,
-    yes: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn self_update_command(version: Option<&str>, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     let current_exe = env::current_exe()?;
     let asset = self_update_release_asset()?;
     let url = self_update_release_url(version, asset);
@@ -2460,9 +2457,7 @@ fn schedule_windows_self_update(
     destination: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !cfg!(windows) {
-        return Err(
-            "Windows self-update scheduling is only available on Windows".into(),
-        );
+        return Err("Windows self-update scheduling is only available on Windows".into());
     }
 
     let script = r#"

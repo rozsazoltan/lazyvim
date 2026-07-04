@@ -81,19 +81,19 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Update version files
+      - name: Update Rust package version
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/set-version.py "${{ steps.meta.outputs.version }}"
           cargo generate-lockfile
 
-      - name: Check whether version files changed
+      - name: Check whether package version changed
         id: diff
         shell: bash
         run: |
           set -euo pipefail
-          if git diff --quiet -- Cargo.toml Cargo.lock VERSION; then
+          if git diff --quiet -- Cargo.toml Cargo.lock; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -114,7 +114,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git checkout -B "$release_branch"
-          git add Cargo.toml Cargo.lock VERSION
+          git add Cargo.toml Cargo.lock
           git commit -m "$title"
           git push --force origin "HEAD:${release_branch}"
 

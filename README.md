@@ -316,7 +316,7 @@ Install or repair only the managed portable tools:
 lazyvim install-tools
 ```
 
-The managed tool directories are prepended to `PATH` when Neovim is started, so LazyVim sees them before broken or incompatible system tools. The launcher also sets `CC`, `CXX`, and `TREE_SITTER_CLI` for Neovim so nvim-treesitter builds parsers with the portable toolchain instead of falling back to a missing or incompatible system compiler.
+The managed tool directories are prepended to `PATH` when Neovim is started, so LazyVim sees them before broken or incompatible system tools. The launcher also sets `CC`, `CXX`, and `TREE_SITTER_CLI` for Neovim so nvim-treesitter builds parsers with the portable toolchain instead of falling back to a missing or incompatible system compiler. It does not configure nvim-treesitter's removed custom compiler option. If an older generated `lua/plugins/portable.lua` file exists, the launcher removes it automatically.
 
 When the portable compiler wrapper changes, the launcher clears previously compiled Treesitter parser output once so broken `.so`/`.dll` files are rebuilt with the managed compiler.
 
@@ -357,7 +357,7 @@ lazyvim doctor
 
 The first run needs Git for lazy.nvim plugin installation and curl for parts of the LazyVim stack. The launcher checks them and attempts native installation when they are missing. LazyVim extras may still need project-specific tools such as language runtimes, package managers, formatters, linters, and LSP servers.
 
-If nvim-treesitter reports `program not found`, `gcc program not found`, or a parser dynamic library error, install or repair the managed tools. The launcher will rebuild the parser output on the next run when the portable toolchain stamp changes.
+If nvim-treesitter reports `program not found`, `gcc program not found`, or a parser dynamic library error, install or repair the managed tools. The launcher will rebuild the parser output on the next run when the portable toolchain stamp changes. If Neovim reports that custom nvim-treesitter compilers are no longer supported, update the launcher and run it once; it removes the old generated `lua/plugins/portable.lua` compatibility file.
 
 If Neovim or managed dependencies cannot be found, run the built-in installers or point the launcher to a binary:
 

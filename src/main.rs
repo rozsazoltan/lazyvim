@@ -449,8 +449,6 @@ fn ensure_system_dependencies(path_value: &OsString) -> Result<(), Box<dyn std::
 fn required_system_commands() -> &'static [&'static str] {
     if cfg!(windows) {
         &["git", "powershell"]
-    } else if cfg!(target_os = "macos") {
-        &["git", "curl", "tar", "unzip"]
     } else {
         &["git", "curl", "tar", "unzip"]
     }
@@ -1098,10 +1096,12 @@ fn install_tree_sitter(home: &Path, path_value: &OsString) -> Result<(), Box<dyn
 
     fs::create_dir_all(&downloads_dir)?;
 
-    if cfg!(target_os = "linux") && install_tree_sitter_from_system_package(path_value).is_ok() {
-        if command_runs(&destination, &["--version"], Some(path_value)) || command_runs(Path::new("tree-sitter"), &["--version"], Some(path_value)) {
-            return Ok(());
-        }
+    if cfg!(target_os = "linux")
+        && install_tree_sitter_from_system_package(path_value).is_ok()
+        && (command_runs(&destination, &["--version"], Some(path_value))
+            || command_runs(Path::new("tree-sitter"), &["--version"], Some(path_value)))
+    {
+        return Ok(());
     }
 
     println!("tree-sitter CLI was not found. Downloading tree-sitter {TREE_SITTER_VERSION} from {url}");

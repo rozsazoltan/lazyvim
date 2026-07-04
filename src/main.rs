@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};
 
@@ -16,13 +16,61 @@ const FD_VERSION: &str = "10.4.2";
 const FD_MACOS_X86_64_VERSION: &str = "10.3.0";
 const LAZYGIT_VERSION: &str = "0.62.2";
 const PORTABLE_TOOLCHAIN_STAMP: &str = "2026-07-04-portable-cc-v4";
-const EMBEDDED_TREE_SITTER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/embedded-tree-sitter"));
+const EMBEDDED_TREE_SITTER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/embedded-tree-sitter"));
 
 #[derive(Debug)]
 struct Cli {
     home: Option<PathBuf>,
     portable_home: bool,
+    user_home: bool,
+    home_action: HomeSwitchAction,
     command: CliCommand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeSwitchAction {
+    Prompt,
+    Move,
+    StartNew,
+    DeleteOld,
+    KeepRemembered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeSource {
+    CliHome,
+    PortableFlag,
+    UserHomeFlag,
+    Environment,
+    Remembered,
+    Default,
+}
+
+#[derive(Debug)]
+struct HomeSelection {
+    path: PathBuf,
+    source: HomeSource,
+    remembered: Option<PathBuf>,
+}
+
+enum HomeConflictResolution {
+    Move,
+    StartNew,
+    DeleteOld,
+    KeepRemembered,
+}
+
+enum HomeRegistryWrite {
+    Written,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeComparison {
+    Same,
+    Different,
+    Unknown,
 }
 
 #[derive(Debug)]
@@ -73,9 +121,15 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = parse_cli(env::args().skip(1).collect());
+    let Cli {
+        home,
+        portable_home,
+        user_home,
+        home_action,
+        command,
+    } = parse_cli(env::args().skip(1).collect());
 
-    match cli.command {
+    match command {
         CliCommand::Help => {
             print_help();
             Ok(())
@@ -85,7 +139,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         CliCommand::Reset { yes } => {
-            let runtime = prepare_runtime(cli.home, cli.portable_home, false, false)?;
+            let runtime =
+                prepare_runtime(home, portable_home, user_home, home_action, false, false)?;
             if !yes {
                 println!("This will delete: {}", runtime.home.display());
                 println!("Run `lazyvim reset --yes` to confirm.");
@@ -100,9 +155,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         command => {
             let bootstrap = matches!(
                 command,
-                CliCommand::Launch(_) | CliCommand::Sync | CliCommand::Restore | CliCommand::Update | CliCommand::Clean
+                CliCommand::Launch(_)
+                    | CliCommand::Sync
+                    | CliCommand::Restore
+                    | CliCommand::Update
+                    | CliCommand::Clean
             );
-            let runtime = prepare_runtime(cli.home, cli.portable_home, bootstrap, true)?;
+            let runtime =
+                prepare_runtime(home, portable_home, user_home, home_action, bootstrap, true)?;
             match command {
                 CliCommand::Launch(args) => launch_nvim(&runtime, &args),
                 CliCommand::Doctor => doctor(&runtime),
@@ -123,6 +183,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn parse_cli(mut args: Vec<String>) -> Cli {
     let mut home = None;
     let mut portable_home = false;
+    let mut user_home = false;
+    let mut home_action = HomeSwitchAction::Prompt;
     let mut index = 0;
 
     while index < args.len() {
@@ -145,6 +207,36 @@ fn parse_cli(mut args: Vec<String>) -> Cli {
 
         if arg == "--portable" || arg == "--portable-home" {
             portable_home = true;
+            args.remove(index);
+            continue;
+        }
+
+        if arg == "--user-home" {
+            user_home = true;
+            args.remove(index);
+            continue;
+        }
+
+        if arg == "--move-home" {
+            home_action = HomeSwitchAction::Move;
+            args.remove(index);
+            continue;
+        }
+
+        if arg == "--new-home" || arg == "--start-new-home" {
+            home_action = HomeSwitchAction::StartNew;
+            args.remove(index);
+            continue;
+        }
+
+        if arg == "--delete-old-home" {
+            home_action = HomeSwitchAction::DeleteOld;
+            args.remove(index);
+            continue;
+        }
+
+        if arg == "--keep-home" {
+            home_action = HomeSwitchAction::KeepRemembered;
             args.remove(index);
             continue;
         }
@@ -173,6 +265,8 @@ fn parse_cli(mut args: Vec<String>) -> Cli {
     Cli {
         home,
         portable_home,
+        user_home,
+        home_action,
         command,
     }
 }
@@ -180,19 +274,18 @@ fn parse_cli(mut args: Vec<String>) -> Cli {
 fn prepare_runtime(
     home_override: Option<PathBuf>,
     portable_home: bool,
+    user_home: bool,
+    home_action: HomeSwitchAction,
     bootstrap: bool,
-    migrate_custom_home: bool,
+    remember_home: bool,
 ) -> Result<Runtime, Box<dyn std::error::Error>> {
     let exe_dir = env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf));
 
-    let uses_custom_home = portable_home || home_override.is_some() || env::var_os("LAZYVIM_HOME").is_some();
-    let home = resolve_home(home_override, portable_home, exe_dir.as_deref())?;
-
-    if migrate_custom_home && uses_custom_home {
-        migrate_default_home_if_needed(&home)?;
-    }
+    let selection =
+        resolve_home_selection(home_override, portable_home, user_home, exe_dir.as_deref())?;
+    let home = resolve_home_switch(selection, home_action, exe_dir.as_deref(), remember_home)?;
 
     let config_home = home.join("config");
     let data_home = home.join("data");
@@ -244,27 +337,356 @@ fn prepare_runtime(
     })
 }
 
-fn resolve_home(
+fn resolve_home_selection(
     home_override: Option<PathBuf>,
     portable_home: bool,
+    user_home: bool,
     exe_dir: Option<&Path>,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+) -> Result<HomeSelection, Box<dyn std::error::Error>> {
+    let remembered = read_remembered_home(exe_dir)?;
+
     if portable_home {
-        return home_next_to_executable(exe_dir);
+        return Ok(HomeSelection {
+            path: home_next_to_executable(exe_dir)?,
+            source: HomeSource::PortableFlag,
+            remembered,
+        });
+    }
+
+    if user_home {
+        return Ok(HomeSelection {
+            path: default_home()?,
+            source: HomeSource::UserHomeFlag,
+            remembered,
+        });
     }
 
     if let Some(path) = home_override {
-        return expand_home(path, exe_dir);
+        return Ok(HomeSelection {
+            path: expand_home(path, exe_dir)?,
+            source: HomeSource::CliHome,
+            remembered,
+        });
     }
 
     if let Some(value) = env::var_os("LAZYVIM_HOME") {
-        return expand_home(PathBuf::from(value), exe_dir);
+        let value = PathBuf::from(value);
+        let text = value.to_string_lossy();
+        let path = if is_user_home_alias(&text) {
+            default_home()?
+        } else {
+            expand_home(value, exe_dir)?
+        };
+
+        return Ok(HomeSelection {
+            path,
+            source: HomeSource::Environment,
+            remembered,
+        });
     }
 
-    Ok(user_home_dir()?.join(DEFAULT_HOME_DIR))
+    if let Some(remembered) = remembered.clone() {
+        return Ok(HomeSelection {
+            path: remembered.clone(),
+            source: HomeSource::Remembered,
+            remembered: Some(remembered),
+        });
+    }
+
+    Ok(HomeSelection {
+        path: default_home()?,
+        source: HomeSource::Default,
+        remembered,
+    })
 }
 
-fn expand_home(path: PathBuf, exe_dir: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn default_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    absolute_path(user_home_dir()?.join(DEFAULT_HOME_DIR))
+}
+
+fn resolve_home_switch(
+    selection: HomeSelection,
+    action: HomeSwitchAction,
+    exe_dir: Option<&Path>,
+    remember_home: bool,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let selected = absolute_path(selection.path.clone())?;
+    let previous = previous_home_for_selection(&selection, &selected)?;
+
+    if let Some(previous) = previous {
+        if homes_are_same(&previous, &selected) != HomeComparison::Same {
+            let resolution = resolve_home_conflict(&previous, &selected, action)?;
+
+            match resolution {
+                HomeConflictResolution::Move => {
+                    move_remembered_home(&previous, &selected)?;
+                    remember_home_if_requested(&selected, exe_dir, remember_home)?;
+                    return Ok(selected);
+                }
+                HomeConflictResolution::StartNew => {
+                    remember_home_if_requested(&selected, exe_dir, remember_home)?;
+                    return Ok(selected);
+                }
+                HomeConflictResolution::DeleteOld => {
+                    delete_previous_home(&previous, &selected)?;
+                    remember_home_if_requested(&selected, exe_dir, remember_home)?;
+                    return Ok(selected);
+                }
+                HomeConflictResolution::KeepRemembered => {
+                    remember_home_if_requested(&previous, exe_dir, remember_home)?;
+                    return Ok(previous);
+                }
+            }
+        }
+    }
+
+    remember_home_if_requested(&selected, exe_dir, remember_home)?;
+    Ok(selected)
+}
+
+fn previous_home_for_selection(
+    selection: &HomeSelection,
+    selected: &Path,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    if matches!(
+        selection.source,
+        HomeSource::Remembered | HomeSource::Default
+    ) {
+        return Ok(None);
+    }
+
+    if let Some(remembered) = &selection.remembered {
+        return Ok(Some(absolute_path(remembered.clone())?));
+    }
+
+    let default = default_home()?;
+    if default.exists() && homes_are_same(&default, selected) != HomeComparison::Same {
+        return Ok(Some(default));
+    }
+
+    Ok(None)
+}
+
+fn resolve_home_conflict(
+    previous: &Path,
+    selected: &Path,
+    action: HomeSwitchAction,
+) -> Result<HomeConflictResolution, Box<dyn std::error::Error>> {
+    match action {
+        HomeSwitchAction::Move => return Ok(HomeConflictResolution::Move),
+        HomeSwitchAction::StartNew => return Ok(HomeConflictResolution::StartNew),
+        HomeSwitchAction::DeleteOld => return Ok(HomeConflictResolution::DeleteOld),
+        HomeSwitchAction::KeepRemembered => return Ok(HomeConflictResolution::KeepRemembered),
+        HomeSwitchAction::Prompt => {}
+    }
+
+    if !should_prompt_for_home_switch() {
+        return Err(format!(
+            "portable home is already remembered at {}; requested {}; rerun with --move-home, --new-home, --delete-old-home, or --keep-home",
+            previous.display(),
+            selected.display()
+        )
+        .into());
+    }
+
+    prompt_home_conflict(previous, selected)
+}
+
+fn should_prompt_for_home_switch() -> bool {
+    env::var_os("CI").is_none() && env::var_os("GITHUB_ACTIONS").is_none()
+}
+
+fn prompt_home_conflict(
+    previous: &Path,
+    selected: &Path,
+) -> Result<HomeConflictResolution, Box<dyn std::error::Error>> {
+    println!("A different LazyVim home is already remembered.");
+    println!("current: {}", previous.display());
+    println!("new:     {}", selected.display());
+    println!();
+    println!("Choose what to do:");
+    println!("  m  move the current home to the new path");
+    println!("  n  start a new home at the new path and keep the old one");
+    println!("  d  delete the old home and start at the new path");
+    println!("  k  keep using the remembered home");
+    println!("  a  abort");
+    print!("Selection [a]: ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    match input.trim().to_ascii_lowercase().as_str() {
+        "m" | "move" => Ok(HomeConflictResolution::Move),
+        "n" | "new" | "start" => Ok(HomeConflictResolution::StartNew),
+        "d" | "delete" => Ok(HomeConflictResolution::DeleteOld),
+        "k" | "keep" => Ok(HomeConflictResolution::KeepRemembered),
+        "a" | "abort" | "" => Err("aborted home switch".into()),
+        value => Err(format!("unknown home switch selection: {value}").into()),
+    }
+}
+
+fn move_remembered_home(
+    previous: &Path,
+    selected: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !previous.exists() {
+        return Err(format!("cannot move {}; it does not exist", previous.display()).into());
+    }
+
+    if selected.exists() {
+        return Err(format!(
+            "cannot move to {}; destination already exists",
+            selected.display()
+        )
+        .into());
+    }
+
+    if selected.starts_with(previous) {
+        return Err(format!(
+            "cannot move {} into itself at {}",
+            previous.display(),
+            selected.display()
+        )
+        .into());
+    }
+
+    if let Some(parent) = selected.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    println!(
+        "Moving portable home from {} to {}",
+        previous.display(),
+        selected.display()
+    );
+
+    move_directory(previous, selected)
+}
+
+fn delete_previous_home(
+    previous: &Path,
+    selected: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !previous.exists() {
+        return Ok(());
+    }
+
+    if selected.starts_with(previous) {
+        return Err(format!(
+            "cannot delete {}; selected home {} is inside it",
+            previous.display(),
+            selected.display()
+        )
+        .into());
+    }
+
+    println!("Deleting previous portable home at {}", previous.display());
+    fs::remove_dir_all(previous)?;
+    Ok(())
+}
+
+fn remember_home_if_requested(
+    home: &Path,
+    exe_dir: Option<&Path>,
+    remember_home: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !remember_home {
+        return Ok(());
+    }
+
+    match write_remembered_home(home, exe_dir) {
+        HomeRegistryWrite::Written => Ok(()),
+        HomeRegistryWrite::Failed(error) => Err(error.into()),
+    }
+}
+
+fn read_remembered_home(
+    exe_dir: Option<&Path>,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    for path in home_registry_candidates(exe_dir)? {
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                let value = content
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty() && !line.starts_with('#'));
+
+                if let Some(value) = value {
+                    return Ok(Some(expand_home(PathBuf::from(value), exe_dir)?));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+
+    Ok(None)
+}
+
+fn write_remembered_home(home: &Path, exe_dir: Option<&Path>) -> HomeRegistryWrite {
+    let content = format!("# Managed by lazyvim.\n{}\n", home.display());
+    let mut last_error = None;
+
+    for path in match home_registry_candidates(exe_dir) {
+        Ok(paths) => paths,
+        Err(error) => return HomeRegistryWrite::Failed(error.to_string()),
+    } {
+        match path.parent().map(fs::create_dir_all) {
+            Some(Ok(())) | None => {}
+            Some(Err(error)) => {
+                last_error = Some(format!("{}: {}", path.display(), error));
+                continue;
+            }
+        }
+
+        match fs::write(&path, &content) {
+            Ok(()) => return HomeRegistryWrite::Written,
+            Err(error) => last_error = Some(format!("{}: {}", path.display(), error)),
+        }
+    }
+
+    HomeRegistryWrite::Failed(format!(
+        "failed to remember portable home: {}",
+        last_error.unwrap_or_else(|| String::from("no registry location is available"))
+    ))
+}
+
+fn home_registry_candidates(
+    exe_dir: Option<&Path>,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut paths = Vec::new();
+
+    if let Some(exe_dir) = exe_dir {
+        paths.push(exe_dir.join(".lazyvim-home"));
+    }
+
+    paths.push(user_home_dir()?.join(".lazyvim-home"));
+    Ok(paths)
+}
+
+fn homes_are_same(left: &Path, right: &Path) -> HomeComparison {
+    let left_abs = absolute_path(left.to_path_buf());
+    let right_abs = absolute_path(right.to_path_buf());
+
+    match (left_abs, right_abs) {
+        (Ok(left), Ok(right)) if left == right => HomeComparison::Same,
+        (Ok(left), Ok(right)) => {
+            let left_canon = fs::canonicalize(&left);
+            let right_canon = fs::canonicalize(&right);
+            match (left_canon, right_canon) {
+                (Ok(left), Ok(right)) if left == right => HomeComparison::Same,
+                _ => HomeComparison::Different,
+            }
+        }
+        _ => HomeComparison::Unknown,
+    }
+}
+
+fn expand_home(
+    path: PathBuf,
+    exe_dir: Option<&Path>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let text = path.to_string_lossy();
 
     if is_portable_home_alias(&text) {
@@ -292,41 +714,13 @@ fn is_portable_home_alias(value: &str) -> bool {
     matches!(value, "portable" | "self" | "exe" | "launcher")
 }
 
+fn is_user_home_alias(value: &str) -> bool {
+    matches!(value, "user" | "user-home" | "home" | "default")
+}
+
 fn home_next_to_executable(exe_dir: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let exe_dir = exe_dir.ok_or("could not resolve launcher executable directory")?;
     Ok(exe_dir.join(DEFAULT_HOME_DIR))
-}
-
-fn migrate_default_home_if_needed(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let source = user_home_dir()?.join(DEFAULT_HOME_DIR);
-    let source = absolute_path(source)?;
-    let destination = absolute_path(destination.to_path_buf())?;
-
-    if source == destination || !source.exists() || destination.exists() {
-        return Ok(());
-    }
-
-    if destination.starts_with(&source) {
-        return Err(format!(
-            "cannot move {} into itself at {}",
-            source.display(),
-            destination.display()
-        )
-        .into());
-    }
-
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    println!(
-        "Moving portable home from {} to {}",
-        source.display(),
-        destination.display()
-    );
-
-    move_directory(&source, &destination)?;
-    Ok(())
 }
 
 fn move_directory(source: &Path, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -537,7 +931,6 @@ fn user_home_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     }
 }
 
-
 fn ensure_system_dependencies(path_value: &OsString) -> Result<(), Box<dyn std::error::Error>> {
     let mut missing = Vec::new();
 
@@ -603,10 +996,16 @@ fn install_system_dependencies(missing: &[String]) -> Result<(), Box<dyn std::er
         return install_linux_system_dependencies(missing);
     }
 
-    Err(format!("automatic dependency installation is not supported on this platform; missing: {}", missing.join(", ")).into())
+    Err(format!(
+        "automatic dependency installation is not supported on this platform; missing: {}",
+        missing.join(", ")
+    )
+    .into())
 }
 
-fn install_windows_system_dependencies(missing: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn install_windows_system_dependencies(
+    missing: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
     if !missing.iter().any(|name| name == "git") {
         return Ok(());
     }
@@ -650,7 +1049,10 @@ fn install_macos_system_dependencies(missing: &[String]) -> Result<(), Box<dyn s
             return Ok(());
         }
 
-        let status = Command::new("brew").arg("install").args(packages).status()?;
+        let status = Command::new("brew")
+            .arg("install")
+            .args(packages)
+            .status()?;
         if status.success() {
             return Ok(());
         }
@@ -682,7 +1084,9 @@ enum LinuxDistro {
 fn install_linux_system_dependencies(missing: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let distro = detect_linux_distro();
     if distro == LinuxDistro::Unknown {
-        return Err("could not detect a supported Linux distribution for dependency installation".into());
+        return Err(
+            "could not detect a supported Linux distribution for dependency installation".into(),
+        );
     }
 
     let packages = linux_system_packages(distro, missing);
@@ -759,16 +1163,22 @@ fn push_unique(packages: &mut Vec<&'static str>, package: &'static str) {
     }
 }
 
-fn install_tree_sitter_from_system_package(path_value: &OsString) -> Result<(), Box<dyn std::error::Error>> {
+fn install_tree_sitter_from_system_package(
+    path_value: &OsString,
+) -> Result<(), Box<dyn std::error::Error>> {
     if command_available("tree-sitter", path_value) {
         return Ok(());
     }
 
     match detect_linux_distro() {
         LinuxDistro::Alpine => run_privileged_shell("apk add --no-cache tree-sitter-cli"),
-        LinuxDistro::Arch => run_privileged_shell("pacman -Sy --noconfirm --needed tree-sitter-cli"),
+        LinuxDistro::Arch => {
+            run_privileged_shell("pacman -Sy --noconfirm --needed tree-sitter-cli")
+        }
         LinuxDistro::Fedora => run_privileged_shell("dnf install -y tree-sitter-cli"),
-        LinuxDistro::Debian => run_privileged_shell("apt-get update && apt-get install -y tree-sitter-cli"),
+        LinuxDistro::Debian => {
+            run_privileged_shell("apt-get update && apt-get install -y tree-sitter-cli")
+        }
         LinuxDistro::Rhel | LinuxDistro::AmazonLinux | LinuxDistro::Unknown => {
             Err("tree-sitter-cli system package is not available for this distro".into())
         }
@@ -798,7 +1208,9 @@ fn detect_linux_distro() -> LinuxDistro {
             "fedora" => LinuxDistro::Fedora,
             "amzn" | "amazonlinux" => LinuxDistro::AmazonLinux,
             "rhel" | "centos" | "rocky" | "almalinux" | "ol" | "olinux" => LinuxDistro::Rhel,
-            _ if id_like_words.contains(" rhel ") || id_like_words.contains(" fedora ") => LinuxDistro::Rhel,
+            _ if id_like_words.contains(" rhel ") || id_like_words.contains(" fedora ") => {
+                LinuxDistro::Rhel
+            }
             _ if id_like_words.contains(" debian ") => LinuxDistro::Debian,
             _ if id_like_words.contains(" arch ") => LinuxDistro::Arch,
             _ => LinuxDistro::Unknown,
@@ -828,9 +1240,16 @@ fn run_privileged_shell(command: &str) -> Result<(), Box<dyn std::error::Error>>
     let status = if is_unix_root() {
         Command::new("sh").arg("-c").arg(command).status()?
     } else if command_available_without_path("sudo") {
-        Command::new("sudo").arg("sh").arg("-c").arg(command).status()?
+        Command::new("sudo")
+            .arg("sh")
+            .arg("-c")
+            .arg(command)
+            .status()?
     } else {
-        return Err(format!("missing system dependencies and sudo is not available. Run as root: {command}").into());
+        return Err(format!(
+            "missing system dependencies and sudo is not available. Run as root: {command}"
+        )
+        .into());
     };
 
     if status.success() {
@@ -975,7 +1394,6 @@ fn build_path(home: &Path, exe_dir: Option<&Path>) -> io::Result<OsString> {
     env::join_paths(paths).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
-
 fn install_deps_command(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
     ensure_system_dependencies(&runtime.path_value)?;
 
@@ -989,13 +1407,19 @@ fn install_deps_command(runtime: &Runtime) -> Result<(), Box<dyn std::error::Err
     ensure_starter_config(&runtime.config_dir)?;
     ensure_portable_lazyvim_config(&runtime.config_dir)?;
 
-    println!("Installed LazyVim dependencies into {}", runtime.home.display());
+    println!(
+        "Installed LazyVim dependencies into {}",
+        runtime.home.display()
+    );
     Ok(())
 }
 
 fn install_tools_command(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
     ensure_managed_tools(&runtime.home, &runtime.path_value)?;
-    println!("Installed portable LazyVim tools into {}", runtime.home.display());
+    println!(
+        "Installed portable LazyVim tools into {}",
+        runtime.home.display()
+    );
     Ok(())
 }
 
@@ -1009,17 +1433,30 @@ fn install_neovim_command(runtime: &Runtime) -> Result<(), Box<dyn std::error::E
 
     install_neovim(&runtime.home)?;
 
-    let installed = runtime.home.join("nvim").join("bin").join(nvim_executable_name());
+    let installed = runtime
+        .home
+        .join("nvim")
+        .join("bin")
+        .join(nvim_executable_name());
     if !command_runs(&installed, &["--version"], Some(&runtime.path_value)) {
-        return Err(format!("Neovim was installed but could not be started from {}", installed.display()).into());
+        return Err(format!(
+            "Neovim was installed but could not be started from {}",
+            installed.display()
+        )
+        .into());
     }
 
-    println!("Installed Neovim into {}", runtime.home.join("nvim").display());
+    println!(
+        "Installed Neovim into {}",
+        runtime.home.join("nvim").display()
+    );
     Ok(())
 }
 
-
-fn ensure_managed_tools(home: &Path, path_value: &OsString) -> Result<(), Box<dyn std::error::Error>> {
+fn ensure_managed_tools(
+    home: &Path,
+    path_value: &OsString,
+) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(home.join("tools"))?;
     fs::create_dir_all(home.join("bin"))?;
 
@@ -1044,7 +1481,14 @@ fn ensure_managed_tools(home: &Path, path_value: &OsString) -> Result<(), Box<dy
         install_fd(home)?;
     }
 
-    let lazygit = managed_tool_path(home, if cfg!(windows) { "lazygit.exe" } else { "lazygit" });
+    let lazygit = managed_tool_path(
+        home,
+        if cfg!(windows) {
+            "lazygit.exe"
+        } else {
+            "lazygit"
+        },
+    );
     if !command_runs(&lazygit, &["--version"], Some(path_value)) {
         install_lazygit(home)?;
     }
@@ -1062,7 +1506,14 @@ fn install_c_compiler_wrappers(home: &Path) -> Result<(), Box<dyn std::error::Er
 
     let launcher = env::current_exe()?;
     let wrapper_names: &[&str] = if cfg!(windows) {
-        &["cc.exe", "gcc.exe", "clang.exe", "c++.exe", "g++.exe", "clang++.exe"]
+        &[
+            "cc.exe",
+            "gcc.exe",
+            "clang.exe",
+            "c++.exe",
+            "g++.exe",
+            "clang++.exe",
+        ]
     } else {
         &["cc", "gcc", "clang", "c++", "g++", "clang++"]
     };
@@ -1074,7 +1525,10 @@ fn install_c_compiler_wrappers(home: &Path) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-fn install_launcher_wrapper(source: &Path, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn install_launcher_wrapper(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     if destination.exists() {
         fs::remove_file(destination)?;
     }
@@ -1101,8 +1555,12 @@ fn is_compiler_wrapper_invocation() -> bool {
 
 fn run_compiler_wrapper() -> Result<i32, Box<dyn std::error::Error>> {
     let exe = env::current_exe()?;
-    let bin_dir = exe.parent().ok_or("compiler wrapper has no parent directory")?;
-    let home = bin_dir.parent().ok_or("compiler wrapper is not inside a LazyVim home bin directory")?;
+    let bin_dir = exe
+        .parent()
+        .ok_or("compiler wrapper has no parent directory")?;
+    let home = bin_dir
+        .parent()
+        .ok_or("compiler wrapper is not inside a LazyVim home bin directory")?;
     let zig = zig_executable_path(home);
 
     if !zig.exists() {
@@ -1153,20 +1611,27 @@ fn compiler_wrapper_mode(exe: &Path) -> &'static str {
 }
 
 fn zig_executable_path(home: &Path) -> PathBuf {
-    home.join("tools").join("zig").join(if cfg!(windows) { "zig.exe" } else { "zig" })
+    home.join("tools")
+        .join("zig")
+        .join(if cfg!(windows) { "zig.exe" } else { "zig" })
 }
 
 fn tree_sitter_executable_path(home: &Path) -> PathBuf {
-    home.join("bin").join(if cfg!(windows) { "tree-sitter.exe" } else { "tree-sitter" })
+    home.join("bin").join(if cfg!(windows) {
+        "tree-sitter.exe"
+    } else {
+        "tree-sitter"
+    })
 }
 
-
 fn compiler_wrapper_path(home: &Path) -> PathBuf {
-    home.join("bin").join(if cfg!(windows) { "cc.exe" } else { "cc" })
+    home.join("bin")
+        .join(if cfg!(windows) { "cc.exe" } else { "cc" })
 }
 
 fn cxx_compiler_wrapper_path(home: &Path) -> PathBuf {
-    home.join("bin").join(if cfg!(windows) { "c++.exe" } else { "c++" })
+    home.join("bin")
+        .join(if cfg!(windows) { "c++.exe" } else { "c++" })
 }
 
 fn ensure_treesitter_cache_for_current_toolchain(
@@ -1184,7 +1649,10 @@ fn ensure_treesitter_cache_for_current_toolchain(
     for path in [
         data_dir.join("site").join("parser"),
         data_dir.join("lazy").join("nvim-treesitter").join("parser"),
-        data_dir.join("lazy").join("nvim-treesitter").join("parser-info"),
+        data_dir
+            .join("lazy")
+            .join("nvim-treesitter")
+            .join("parser-info"),
     ] {
         if path.exists() {
             fs::remove_dir_all(&path)?;
@@ -1224,25 +1692,40 @@ return {
     Ok(())
 }
 
-
 fn install_ripgrep(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let asset = ripgrep_release_asset()?;
-    let url = format!("https://github.com/BurntSushi/ripgrep/releases/download/{RIPGREP_VERSION}/{asset}");
-    install_single_binary_from_archive(home, "ripgrep", &url, &asset, if cfg!(windows) { "rg.exe" } else { "rg" })
+    let url = format!(
+        "https://github.com/BurntSushi/ripgrep/releases/download/{RIPGREP_VERSION}/{asset}"
+    );
+    install_single_binary_from_archive(
+        home,
+        "ripgrep",
+        &url,
+        &asset,
+        if cfg!(windows) { "rg.exe" } else { "rg" },
+    )
 }
 
 fn ripgrep_release_asset() -> Result<String, Box<dyn std::error::Error>> {
     if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
-        return Ok(format!("ripgrep-{RIPGREP_VERSION}-x86_64-pc-windows-msvc.zip"));
+        return Ok(format!(
+            "ripgrep-{RIPGREP_VERSION}-x86_64-pc-windows-msvc.zip"
+        ));
     }
     if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        return Ok(format!("ripgrep-{RIPGREP_VERSION}-x86_64-unknown-linux-musl.tar.gz"));
+        return Ok(format!(
+            "ripgrep-{RIPGREP_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+        ));
     }
     if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
-        return Ok(format!("ripgrep-{RIPGREP_VERSION}-x86_64-apple-darwin.tar.gz"));
+        return Ok(format!(
+            "ripgrep-{RIPGREP_VERSION}-x86_64-apple-darwin.tar.gz"
+        ));
     }
     if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        return Ok(format!("ripgrep-{RIPGREP_VERSION}-aarch64-apple-darwin.tar.gz"));
+        return Ok(format!(
+            "ripgrep-{RIPGREP_VERSION}-aarch64-apple-darwin.tar.gz"
+        ));
     }
     Err("automatic ripgrep installation is not supported on this platform".into())
 }
@@ -1250,15 +1733,27 @@ fn ripgrep_release_asset() -> Result<String, Box<dyn std::error::Error>> {
 fn install_fd(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let (version, asset) = fd_release_asset()?;
     let url = format!("https://github.com/sharkdp/fd/releases/download/v{version}/{asset}");
-    install_single_binary_from_archive(home, "fd", &url, &asset, if cfg!(windows) { "fd.exe" } else { "fd" })
+    install_single_binary_from_archive(
+        home,
+        "fd",
+        &url,
+        &asset,
+        if cfg!(windows) { "fd.exe" } else { "fd" },
+    )
 }
 
 fn fd_release_asset() -> Result<(&'static str, String), Box<dyn std::error::Error>> {
     if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
-        return Ok((FD_VERSION, format!("fd-v{FD_VERSION}-x86_64-pc-windows-msvc.zip")));
+        return Ok((
+            FD_VERSION,
+            format!("fd-v{FD_VERSION}-x86_64-pc-windows-msvc.zip"),
+        ));
     }
     if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        return Ok((FD_VERSION, format!("fd-v{FD_VERSION}-x86_64-unknown-linux-musl.tar.gz")));
+        return Ok((
+            FD_VERSION,
+            format!("fd-v{FD_VERSION}-x86_64-unknown-linux-musl.tar.gz"),
+        ));
     }
     if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
         return Ok((
@@ -1267,15 +1762,30 @@ fn fd_release_asset() -> Result<(&'static str, String), Box<dyn std::error::Erro
         ));
     }
     if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        return Ok((FD_VERSION, format!("fd-v{FD_VERSION}-aarch64-apple-darwin.tar.gz")));
+        return Ok((
+            FD_VERSION,
+            format!("fd-v{FD_VERSION}-aarch64-apple-darwin.tar.gz"),
+        ));
     }
     Err("automatic fd installation is not supported on this platform".into())
 }
 
 fn install_lazygit(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let asset = lazygit_release_asset()?;
-    let url = format!("https://github.com/jesseduffield/lazygit/releases/download/v{LAZYGIT_VERSION}/{asset}");
-    install_single_binary_from_archive(home, "lazygit", &url, &asset, if cfg!(windows) { "lazygit.exe" } else { "lazygit" })
+    let url = format!(
+        "https://github.com/jesseduffield/lazygit/releases/download/v{LAZYGIT_VERSION}/{asset}"
+    );
+    install_single_binary_from_archive(
+        home,
+        "lazygit",
+        &url,
+        &asset,
+        if cfg!(windows) {
+            "lazygit.exe"
+        } else {
+            "lazygit"
+        },
+    )
 }
 
 fn lazygit_release_asset() -> Result<String, Box<dyn std::error::Error>> {
@@ -1335,7 +1845,11 @@ fn extract_single_tool_archive(
             .arg(temp_dir)
             .status()?;
         if !status.success() {
-            return Err(format!("failed to extract {}: tar exited with {status}", archive_path.display()).into());
+            return Err(format!(
+                "failed to extract {}: tar exited with {status}",
+                archive_path.display()
+            )
+            .into());
         }
     }
 
@@ -1352,7 +1866,10 @@ fn extract_single_tool_archive(
     Ok(())
 }
 
-fn extract_zip_archive(archive_path: &Path, temp_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn extract_zip_archive(
+    archive_path: &Path,
+    temp_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     if cfg!(windows) {
         let script = r#"
 $ErrorActionPreference = 'Stop'
@@ -1372,7 +1889,11 @@ Expand-Archive -LiteralPath $archive -DestinationPath $temp -Force
         if status.success() {
             return Ok(());
         }
-        return Err(format!("failed to extract {}: PowerShell exited with {status}", archive_path.display()).into());
+        return Err(format!(
+            "failed to extract {}: PowerShell exited with {status}",
+            archive_path.display()
+        )
+        .into());
     }
 
     extract_zip_with_available_tool(archive_path, temp_dir).map(|_| ())
@@ -1415,7 +1936,10 @@ fn zig_release_asset() -> Result<String, Box<dyn std::error::Error>> {
     Err("automatic Zig installation is not supported on this platform".into())
 }
 
-fn install_embedded_tree_sitter(home: &Path, path_value: &OsString) -> Result<bool, Box<dyn std::error::Error>> {
+fn install_embedded_tree_sitter(
+    home: &Path,
+    path_value: &OsString,
+) -> Result<bool, Box<dyn std::error::Error>> {
     if EMBEDDED_TREE_SITTER.is_empty() {
         return Ok(false);
     }
@@ -1436,7 +1960,10 @@ fn install_embedded_tree_sitter(home: &Path, path_value: &OsString) -> Result<bo
     Ok(false)
 }
 
-fn install_system_tree_sitter_wrapper(home: &Path, path_value: &OsString) -> Result<bool, Box<dyn std::error::Error>> {
+fn install_system_tree_sitter_wrapper(
+    home: &Path,
+    path_value: &OsString,
+) -> Result<bool, Box<dyn std::error::Error>> {
     if !cfg!(target_os = "linux") {
         return Ok(false);
     }
@@ -1482,7 +2009,10 @@ fn resolve_system_command(command_name: &str, path_value: &OsString) -> Option<P
     }
 }
 
-fn install_tree_sitter(home: &Path, path_value: &OsString) -> Result<(), Box<dyn std::error::Error>> {
+fn install_tree_sitter(
+    home: &Path,
+    path_value: &OsString,
+) -> Result<(), Box<dyn std::error::Error>> {
     let destination = tree_sitter_executable_path(home);
 
     if install_embedded_tree_sitter(home, path_value)? {
@@ -1499,7 +2029,9 @@ fn install_tree_sitter(home: &Path, path_value: &OsString) -> Result<(), Box<dyn
 
     let mut errors = Vec::new();
     for (version, asset) in tree_sitter_release_assets()? {
-        let url = format!("https://github.com/tree-sitter/tree-sitter/releases/download/v{version}/{asset}");
+        let url = format!(
+            "https://github.com/tree-sitter/tree-sitter/releases/download/v{version}/{asset}"
+        );
         let archive_path = downloads_dir.join(&asset);
 
         println!("tree-sitter CLI was not found. Downloading tree-sitter {version} from {url}");
@@ -1519,17 +2051,27 @@ fn install_tree_sitter(home: &Path, path_value: &OsString) -> Result<(), Box<dyn
         }
     }
 
-    Err(format!("failed to install a working tree-sitter CLI: {}", errors.join("; ")).into())
+    Err(format!(
+        "failed to install a working tree-sitter CLI: {}",
+        errors.join("; ")
+    )
+    .into())
 }
 
 fn tree_sitter_release_assets() -> Result<Vec<(&'static str, String)>, Box<dyn std::error::Error>> {
     if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
-        return Ok(vec![(TREE_SITTER_VERSION, "tree-sitter-cli-windows-x64.zip".to_string())]);
+        return Ok(vec![(
+            TREE_SITTER_VERSION,
+            "tree-sitter-cli-windows-x64.zip".to_string(),
+        )]);
     }
 
     if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
         return Ok(vec![
-            (TREE_SITTER_VERSION, "tree-sitter-cli-linux-x64.zip".to_string()),
+            (
+                TREE_SITTER_VERSION,
+                "tree-sitter-cli-linux-x64.zip".to_string(),
+            ),
             ("0.26.7", "tree-sitter-linux-x64.gz".to_string()),
             ("0.25.10", "tree-sitter-linux-x64.gz".to_string()),
             ("0.24.7", "tree-sitter-linux-x64.gz".to_string()),
@@ -1537,11 +2079,17 @@ fn tree_sitter_release_assets() -> Result<Vec<(&'static str, String)>, Box<dyn s
     }
 
     if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
-        return Ok(vec![(TREE_SITTER_VERSION, "tree-sitter-cli-macos-x64.zip".to_string())]);
+        return Ok(vec![(
+            TREE_SITTER_VERSION,
+            "tree-sitter-cli-macos-x64.zip".to_string(),
+        )]);
     }
 
     if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        return Ok(vec![(TREE_SITTER_VERSION, "tree-sitter-cli-macos-arm64.zip".to_string())]);
+        return Ok(vec![(
+            TREE_SITTER_VERSION,
+            "tree-sitter-cli-macos-arm64.zip".to_string(),
+        )]);
     }
 
     Err("automatic tree-sitter CLI installation is not supported on this platform".into())
@@ -1569,7 +2117,11 @@ fn extract_archive_strip_first_directory(
             .status()?;
 
         if !status.success() {
-            return Err(format!("failed to extract {}: tar exited with {status}", archive_path.display()).into());
+            return Err(format!(
+                "failed to extract {}: tar exited with {status}",
+                archive_path.display()
+            )
+            .into());
         }
 
         if install_dir.exists() {
@@ -1601,7 +2153,14 @@ fn extract_tree_sitter_archive(
         extract_tree_sitter_with_powershell(archive_path, temp_dir, destination)?;
     } else {
         let extracted = extract_zip_with_available_tool(archive_path, temp_dir)?;
-        let source = find_extracted_tool(&extracted, if cfg!(windows) { "tree-sitter.exe" } else { "tree-sitter" })?;
+        let source = find_extracted_tool(
+            &extracted,
+            if cfg!(windows) {
+                "tree-sitter.exe"
+            } else {
+                "tree-sitter"
+            },
+        )?;
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1615,7 +2174,10 @@ fn extract_tree_sitter_archive(
     Ok(())
 }
 
-fn extract_gzip_executable(archive_path: &Path, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn extract_gzip_executable(
+    archive_path: &Path,
+    destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1629,14 +2191,22 @@ fn extract_gzip_executable(archive_path: &Path, destination: &Path) -> Result<()
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("failed to extract {} with gzip: {}", archive_path.display(), stderr.trim()).into());
+        return Err(format!(
+            "failed to extract {} with gzip: {}",
+            archive_path.display(),
+            stderr.trim()
+        )
+        .into());
     }
 
     fs::write(destination, output.stdout)?;
     Ok(())
 }
 
-fn extract_zip_with_available_tool(archive_path: &Path, temp_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn extract_zip_with_available_tool(
+    archive_path: &Path,
+    temp_dir: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let python = Command::new("python3")
         .arg("-m")
         .arg("zipfile")
@@ -1667,7 +2237,10 @@ fn extract_zip_with_available_tool(archive_path: &Path, temp_dir: &Path) -> Resu
     .into())
 }
 
-fn find_extracted_tool(root: &Path, executable_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn find_extracted_tool(
+    root: &Path,
+    executable_name: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(path) = stack.pop() {
@@ -1752,7 +2325,9 @@ fn make_executable(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn install_neovim_from_system_package(path_value: &OsString) -> Result<bool, Box<dyn std::error::Error>> {
+fn install_neovim_from_system_package(
+    path_value: &OsString,
+) -> Result<bool, Box<dyn std::error::Error>> {
     if !cfg!(target_os = "linux") || detect_linux_distro() != LinuxDistro::Alpine {
         return Ok(false);
     }
@@ -1761,7 +2336,11 @@ fn install_neovim_from_system_package(path_value: &OsString) -> Result<bool, Box
         run_privileged_shell("apk add --no-cache neovim")?;
     }
 
-    Ok(command_runs(Path::new("nvim"), &["--version"], Some(path_value)))
+    Ok(command_runs(
+        Path::new("nvim"),
+        &["--version"],
+        Some(path_value),
+    ))
 }
 
 fn install_neovim(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -1823,11 +2402,17 @@ fn download_file(url: &str, destination: &Path) -> Result<(), Box<dyn std::error
 
     match curl {
         Ok(status) => Err(format!("failed to download {url}: curl exited with {status}").into()),
-        Err(error) => Err(format!("failed to download {url}: curl is required but could not be started: {error}").into()),
+        Err(error) => Err(format!(
+            "failed to download {url}: curl is required but could not be started: {error}"
+        )
+        .into()),
     }
 }
 
-fn download_file_with_powershell(url: &str, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn download_file_with_powershell(
+    url: &str,
+    destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let script = r#"
 $ErrorActionPreference = 'Stop'
 $url = $env:LAZYVIM_DOWNLOAD_URL
@@ -1854,7 +2439,10 @@ Invoke-WebRequest -Uri $url -OutFile $dest
     }
 }
 
-fn extract_neovim_archive(home: &Path, archive_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn extract_neovim_archive(
+    home: &Path,
+    archive_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let install_dir = home.join("nvim");
     let temp_dir = home.join(".nvim-install");
 
@@ -1875,7 +2463,11 @@ fn extract_neovim_archive(home: &Path, archive_path: &Path) -> Result<(), Box<dy
             .status()?;
 
         if !status.success() {
-            return Err(format!("failed to extract {}: tar exited with {status}", archive_path.display()).into());
+            return Err(format!(
+                "failed to extract {}: tar exited with {status}",
+                archive_path.display()
+            )
+            .into());
         }
 
         if install_dir.exists() {
@@ -2000,7 +2592,10 @@ fn clear_cargo_target_env(command: &mut Command) {
 
 fn command_runs(command_path: &Path, args: &[&str], path_value: Option<&OsString>) -> bool {
     let mut command = Command::new(command_path);
-    command.args(args).stdout(Stdio::null()).stderr(Stdio::null());
+    command
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
     if let Some(path_value) = path_value {
         command.env("PATH", path_value);
@@ -2025,21 +2620,29 @@ fn base_command(runtime: &Runtime) -> Command {
         .env("CFLAGS", "-O2")
         .env("CXXFLAGS", "-O2")
         .env("CC_KNOWN_WRAPPER_CUSTOM", "cc")
-        .env("TREE_SITTER_CLI", tree_sitter_executable_path(&runtime.home));
+        .env(
+            "TREE_SITTER_CLI",
+            tree_sitter_executable_path(&runtime.home),
+        );
 
     clear_cargo_target_env(&mut command);
     command
 }
 
 fn launch_nvim(runtime: &Runtime, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let status = base_command(runtime)
-        .args(args)
-        .status()
-        .map_err(|error| format!("failed to start Neovim at {}: {error}", runtime.nvim.display()))?;
+    let status = base_command(runtime).args(args).status().map_err(|error| {
+        format!(
+            "failed to start Neovim at {}: {error}",
+            runtime.nvim.display()
+        )
+    })?;
     exit(status.code().unwrap_or(1));
 }
 
-fn run_lazy_command(runtime: &Runtime, command_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run_lazy_command(
+    runtime: &Runtime,
+    command_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let lazy_command = format!("+Lazy! {command_name}");
     let output = base_command(runtime)
         .arg("--headless")
@@ -2063,7 +2666,10 @@ fn print_process_output(stdout: &[u8], stderr: &[u8]) {
 
 fn lazy_output_has_errors(output: &[u8]) -> bool {
     let text = String::from_utf8_lossy(output).to_lowercase();
-    text.contains("nvim-treesitter/install/") && (text.contains(" error:") || text.contains("error during") || text.contains("failed to compile parser"))
+    text.contains("nvim-treesitter/install/")
+        && (text.contains(" error:")
+            || text.contains("error during")
+            || text.contains("failed to compile parser"))
 }
 
 fn doctor(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
@@ -2075,15 +2681,69 @@ fn doctor(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
     let mut failures = 0;
 
     for check in [
-        check_command("nvim", &runtime.nvim, &["--version"], true, Some(&runtime.path_value))?,
-        check_command("zig", Path::new("zig"), &["version"], true, Some(&runtime.path_value))?,
-        check_command("cc", &compiler_wrapper_path(&runtime.home), &["--version"], true, Some(&runtime.path_value))?,
-        check_command("tree-sitter", Path::new("tree-sitter"), &["--version"], true, Some(&runtime.path_value))?,
-        check_command("git", Path::new("git"), &["--version"], true, Some(&runtime.path_value))?,
-        check_command("curl", Path::new("curl"), &["--version"], true, Some(&runtime.path_value))?,
-        check_command("rg", Path::new("rg"), &["--version"], true, Some(&runtime.path_value))?,
-        check_command("fd", Path::new("fd"), &["--version"], true, Some(&runtime.path_value))?,
-        check_command("lazygit", Path::new("lazygit"), &["--version"], true, Some(&runtime.path_value))?,
+        check_command(
+            "nvim",
+            &runtime.nvim,
+            &["--version"],
+            true,
+            Some(&runtime.path_value),
+        )?,
+        check_command(
+            "zig",
+            Path::new("zig"),
+            &["version"],
+            true,
+            Some(&runtime.path_value),
+        )?,
+        check_command(
+            "cc",
+            &compiler_wrapper_path(&runtime.home),
+            &["--version"],
+            true,
+            Some(&runtime.path_value),
+        )?,
+        check_command(
+            "tree-sitter",
+            Path::new("tree-sitter"),
+            &["--version"],
+            true,
+            Some(&runtime.path_value),
+        )?,
+        check_command(
+            "git",
+            Path::new("git"),
+            &["--version"],
+            true,
+            Some(&runtime.path_value),
+        )?,
+        check_command(
+            "curl",
+            Path::new("curl"),
+            &["--version"],
+            true,
+            Some(&runtime.path_value),
+        )?,
+        check_command(
+            "rg",
+            Path::new("rg"),
+            &["--version"],
+            true,
+            Some(&runtime.path_value),
+        )?,
+        check_command(
+            "fd",
+            Path::new("fd"),
+            &["--version"],
+            true,
+            Some(&runtime.path_value),
+        )?,
+        check_command(
+            "lazygit",
+            Path::new("lazygit"),
+            &["--version"],
+            true,
+            Some(&runtime.path_value),
+        )?,
     ] {
         if !check {
             failures += 1;
@@ -2100,10 +2760,23 @@ fn doctor(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
 fn print_locations(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
     println!("home:        {}", runtime.home.display());
     println!("config:      {}", runtime.config_dir.display());
-    println!("data:        {}", runtime.data_home.join(APP_NAME).display());
-    println!("state:       {}", runtime.state_home.join(APP_NAME).display());
-    println!("cache:       {}", runtime.cache_home.join(APP_NAME).display());
+    println!(
+        "data:        {}",
+        runtime.data_home.join(APP_NAME).display()
+    );
+    println!(
+        "state:       {}",
+        runtime.state_home.join(APP_NAME).display()
+    );
+    println!(
+        "cache:       {}",
+        runtime.cache_home.join(APP_NAME).display()
+    );
     println!("nvim:        {}", runtime.nvim.display());
+
+    if let Ok(Some(remembered)) = read_remembered_home(runtime.exe_dir.as_deref()) {
+        println!("remembered:  {}", remembered.display());
+    }
 
     if let Some(exe_dir) = &runtime.exe_dir {
         println!("launcher:    {}", exe_dir.display());
@@ -2120,7 +2793,10 @@ fn check_command(
     path_value: Option<&OsString>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut command = Command::new(command_path);
-    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     if let Some(path_value) = path_value {
         command.env("PATH", path_value);
@@ -2144,7 +2820,11 @@ fn check_command(
         Ok(output) => {
             let message = String::from_utf8_lossy(&output.stderr);
             let level = if required { "fail" } else { "warn" };
-            println!("[{level}] {label}: exited with {} {}", output.status, message.trim());
+            println!(
+                "[{level}] {label}: exited with {} {}",
+                output.status,
+                message.trim()
+            );
             Ok(!required)
         }
         Err(error) => {
@@ -2159,12 +2839,21 @@ fn print_help() {
     println!("lazyvim {}", env!("CARGO_PKG_VERSION"));
     println!();
     println!("Usage:");
-    println!("  lazyvim [--home <path>] [--portable-home] [nvim args...]");
-    println!("  lazyvim [--home <path>] [--portable-home] <command>");
+    println!("  lazyvim [--home <path>|--portable-home|--user-home] [nvim args...]");
+    println!("  lazyvim [--home <path>|--portable-home|--user-home] <command>");
     println!();
     println!("Options:");
-    println!("  --home <path>      Use a custom portable home for this run");
-    println!("  --portable-home    Store .lazyvim next to the launcher executable");
+    println!("  --home <path>       Use and remember a custom portable home");
+    println!("  --portable-home     Store and remember .lazyvim next to the launcher executable");
+    println!("  --user-home         Use and remember ~/.lazyvim");
+    println!(
+        "  --move-home         Move the remembered home to the selected home without prompting"
+    );
+    println!(
+        "  --new-home          Start a new selected home and keep the old one without prompting"
+    );
+    println!("  --delete-old-home   Delete the old remembered home and use the selected home without prompting");
+    println!("  --keep-home         Keep using the remembered home without prompting");
     println!();
     println!("Commands:");
     println!("  where      Print resolved portable directories");
@@ -2180,7 +2869,7 @@ fn print_help() {
     println!("  help       Print this help");
     println!();
     println!("Environment:");
-    println!("  LAZYVIM_HOME                Override ~/.lazyvim; use 'portable' for executable-local home");
+    println!("  LAZYVIM_HOME                Select a home; use 'portable' or 'user'");
     println!("  LAZYVIM_NVIM                Use a specific nvim executable");
     println!("  LAZYVIM_STARTER_REPOSITORY  Override the LazyVim starter repository");
 }
@@ -2207,7 +2896,10 @@ mod tests {
             "parser.c",
         ]));
 
-        assert_eq!(string_args(args), vec![String::from("-O2"), String::from("parser.c")]);
+        assert_eq!(
+            string_args(args),
+            vec![String::from("-O2"), String::from("parser.c")]
+        );
     }
 
     #[test]
@@ -2219,7 +2911,10 @@ mod tests {
             "parser.c",
         ]));
 
-        assert_eq!(string_args(args), vec![String::from("-O2"), String::from("parser.c")]);
+        assert_eq!(
+            string_args(args),
+            vec![String::from("-O2"), String::from("parser.c")]
+        );
     }
 
     #[test]
@@ -2231,7 +2926,10 @@ mod tests {
             "parser.c",
         ]));
 
-        assert_eq!(string_args(args), vec![String::from("-O2"), String::from("parser.c")]);
+        assert_eq!(
+            string_args(args),
+            vec![String::from("-O2"), String::from("parser.c")]
+        );
     }
 
     #[test]
@@ -2253,5 +2951,4 @@ mod tests {
         assert!(packages.contains(&"curl-minimal"));
         assert!(!packages.contains(&"curl"));
     }
-
 }

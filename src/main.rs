@@ -333,19 +333,126 @@ fn move_directory(source: &Path, destination: &Path) -> Result<(), Box<dyn std::
     match fs::rename(source, destination) {
         Ok(()) => Ok(()),
         Err(rename_error) => {
-            copy_directory(source, destination).map_err(|copy_error| {
-                format!(
+            let temp_destination = temporary_move_destination(destination)?;
+            if temp_destination.exists() {
+                fs::remove_dir_all(&temp_destination)?;
+            }
+
+            let copy_result = copy_directory_for_move(source, &temp_destination);
+            if let Err(copy_error) = copy_result {
+                let _ = fs::remove_dir_all(&temp_destination);
+                return Err(format!(
                     "failed to move {} to {}: rename failed with {}; copy fallback failed with {}",
                     source.display(),
                     destination.display(),
                     rename_error,
                     copy_error
                 )
+                .into());
+            }
+
+            if destination.exists() {
+                let _ = fs::remove_dir_all(&temp_destination);
+                return Err(format!(
+                    "failed to move {} to {}: rename failed with {}; destination already exists",
+                    source.display(),
+                    destination.display(),
+                    rename_error
+                )
+                .into());
+            }
+
+            fs::rename(&temp_destination, destination).map_err(|move_error| {
+                let _ = fs::remove_dir_all(&temp_destination);
+                format!(
+                    "failed to move copied home from {} to {}: {}",
+                    temp_destination.display(),
+                    destination.display(),
+                    move_error
+                )
             })?;
+
             fs::remove_dir_all(source)?;
             Ok(())
         }
     }
+}
+
+fn temporary_move_destination(destination: &Path) -> io::Result<PathBuf> {
+    let parent = destination.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", destination.display()),
+        )
+    })?;
+
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("lazyvim-home");
+
+    Ok(parent.join(format!(".{name}.moving-{}", std::process::id())))
+}
+
+fn copy_directory_for_move(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    {
+        if let Err(robocopy_error) = copy_directory_with_robocopy(source, destination) {
+            if destination.exists() {
+                let _ = fs::remove_dir_all(destination);
+            }
+
+            copy_directory(source, destination).map_err(|copy_error| {
+                format!("robocopy failed with {robocopy_error}; rust copy failed with {copy_error}")
+            })?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    {
+        copy_directory(source, destination)?;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn copy_directory_with_robocopy(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(destination)?;
+
+    let output = Command::new("robocopy")
+        .arg(source)
+        .arg(destination)
+        .args([
+            "/E",
+            "/COPY:DAT",
+            "/DCOPY:DAT",
+            "/R:2",
+            "/W:1",
+            "/NFL",
+            "/NDL",
+            "/NJH",
+            "/NJS",
+            "/NP",
+        ])
+        .output()?;
+
+    let code = output.status.code().unwrap_or(16);
+    if code <= 7 {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    Err(format!("exit code {code}; stdout: {stdout}; stderr: {stderr}").into())
 }
 
 fn copy_directory(source: &Path, destination: &Path) -> io::Result<()> {

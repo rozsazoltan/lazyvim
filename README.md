@@ -232,6 +232,8 @@ lazyvim --portable-home .
 
 This keeps existing config, plugins, Neovim, managed tools, cache, state, and Mason packages instead of starting from an empty profile. If the target home already exists, the launcher does not overwrite it.
 
+On Windows, moving between drives uses a copy-then-swap fallback so the target home is only created after the copy succeeds. If an older failed migration left a partial target directory behind, remove that partial directory first and run the command again.
+
 Print the resolved locations:
 
 ```sh

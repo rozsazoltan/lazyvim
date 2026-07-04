@@ -73,6 +73,7 @@ enum HomeComparison {
     Unknown,
 }
 
+#[derive(Debug)]
 enum CliCommand {
     Launch(Vec<String>),
     Doctor,
@@ -386,9 +387,9 @@ fn resolve_home_selection(
 
     if let Some(remembered) = remembered.clone() {
         return Ok(HomeSelection {
-            path: remembered,
+            path: remembered.clone(),
             source: HomeSource::Remembered,
-            remembered,
+            remembered: Some(remembered),
         });
     }
 

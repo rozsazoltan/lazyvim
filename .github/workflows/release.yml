@@ -134,6 +134,34 @@ jobs:
           git commit -m "$title"
           git push origin "HEAD:${TARGET_BRANCH}"
 
+      - name: Delete temporary release branch
+        if: always()
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${VERSION:-}"
+          if [[ -z "$version" ]]; then
+            version="${INPUT_VERSION#v}"
+          fi
+
+          release_branch="chore/release-${version}"
+
+          if [[ ! -d .git ]]; then
+            echo "No git checkout is available. Skipping release branch cleanup."
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --heads origin "$release_branch" >/dev/null 2>&1; then
+            echo "Deleting temporary release branch: ${release_branch}"
+            git push origin --delete "$release_branch"
+          else
+            echo "Temporary release branch does not exist: ${release_branch}"
+          fi
+
       - name: Resolve release ref
         id: final
         shell: bash

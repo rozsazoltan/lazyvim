@@ -32,7 +32,7 @@ By default, everything is stored under:
 ~/.lazyvim
 ```
 
-The launcher prepares the portable directory on first run, writes the starter LazyVim config if it does not exist yet, then starts Neovim with dedicated XDG paths:
+The launcher prepares the portable directory on first run, clones the official [LazyVim starter](https://github.com/LazyVim/starter) config if it does not exist yet, removes its `.git` directory, then starts Neovim with dedicated XDG paths:
 
 ```text
 ~/.lazyvim/config/lazyvim   # LazyVim config
@@ -85,7 +85,7 @@ Invoke-WebRequest https://github.com/rozsazoltan/lazyvim/releases/latest/downloa
 Then add `%LOCALAPPDATA%\Programs\lazyvim\bin` to your user `PATH` if it is not already there.
 
 > [!IMPORTANT]
-> The release asset is the `lazyvim` launcher executable. It manages the portable LazyVim home, but it still starts Neovim. Install Neovim normally, put `nvim` in `~/.lazyvim/bin`, or set `LAZYVIM_NVIM` if the launcher cannot find it.
+> The release asset is the `lazyvim` launcher executable. It manages the portable LazyVim home, but it still starts Neovim. Install Neovim normally, put `nvim` in `~/.lazyvim/bin`, or set `LAZYVIM_NVIM` if the launcher cannot find it. The first run also needs Git so the launcher can fetch the official LazyVim starter config.
 
 Release checksums are published as `SHA256SUMS` next to the executables.
 
@@ -97,7 +97,7 @@ Open any project directory and run:
 lazyvim .
 ```
 
-The first run creates the portable home and lets LazyVim/lazy.nvim install plugins into `~/.lazyvim`.
+The first run creates the portable home, fetches the official LazyVim starter config, and lets LazyVim/lazy.nvim install plugins into `~/.lazyvim`.
 
 ### Upgrade
 
@@ -192,6 +192,7 @@ This keeps the release itself as a single executable while still allowing custom
 |---|---|
 | `LAZYVIM_HOME` | Overrides the default `~/.lazyvim` portable home. |
 | `LAZYVIM_NVIM` | Uses a specific Neovim executable. |
+| `LAZYVIM_STARTER_REPOSITORY` | Overrides the LazyVim starter repository used for first-run bootstrap. |
 
 The launcher sets these variables automatically before starting Neovim:
 
@@ -211,7 +212,7 @@ Run the built-in doctor command first:
 lazyvim doctor
 ```
 
-LazyVim plugins may need external developer tools depending on the enabled extras and the project you open. Common examples are Git, curl, ripgrep, fd, a C compiler, language runtimes, package managers, formatters, linters, and LSP servers.
+The first run needs Git to clone the LazyVim starter config. LazyVim plugins may also need external developer tools depending on the enabled extras and the project you open. Common examples are curl, ripgrep, fd, a C compiler, language runtimes, package managers, formatters, linters, and LSP servers.
 
 If Neovim cannot be found, either install Neovim normally or point the launcher to a binary:
 
@@ -240,7 +241,7 @@ Keep changes small and focused. User-facing behavior should stay portable by def
 
 ## License & Acknowledgments
 
-This project would not exist without [Neovim](https://github.com/neovim/neovim), [LazyVim](https://github.com/LazyVim/LazyVim), [lazy.nvim](https://github.com/folke/lazy.nvim), and their creators and contributors.
+This project would not exist without [Neovim](https://github.com/neovim/neovim), [LazyVim](https://github.com/LazyVim/LazyVim), the [LazyVim starter](https://github.com/LazyVim/starter), [lazy.nvim](https://github.com/folke/lazy.nvim), and their creators and contributors.
 
 It is open source and released under the [GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)](https://www.gnu.org/licenses/agpl-3.0.html).
 

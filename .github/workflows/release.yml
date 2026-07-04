@@ -75,7 +75,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/set-version.py "${{ steps.meta.outputs.version }}"
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          version = "${{ steps.meta.outputs.version }}"
+          root = Path.cwd()
+          semver = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
+
+          if not semver.match(version):
+              raise SystemExit(f"Invalid SemVer version: {version}")
+
+          def replace_once(path: Path, pattern: str, replacement: str) -> None:
+              text = path.read_text(encoding="utf-8")
+              updated, count = re.subn(pattern, replacement, text, count=1, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f"Could not update {path}")
+              path.write_text(updated, encoding="utf-8")
+
+          replace_once(root / "Cargo.toml", r'^version\s*=\s*"[^"]+"', f'version = "{version}"')
+          replace_once(root / "Cargo.lock", r'(?m)(^name\s*=\s*"lazyvim"\nversion\s*=\s*)"[^"]+"', rf'\1"{version}"')
+          PY
           cargo generate-lockfile
 
       - name: Check whether package version changed
@@ -212,13 +232,62 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
           find dist/artifacts -type f | sort
           (cd dist/artifacts && sha256sum * > SHA256SUMS)
-          chmod +x scripts/release-notes.sh
-          scripts/release-notes.sh "${{ needs.prepare.outputs.version }}" dist/release-notes.md
+
+          repo="${GITHUB_REPOSITORY}"
+          tag="v${VERSION}"
+          previous_tag=""
+          if previous_tag="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null)"; then
+            :
+          else
+            previous_tag=""
+          fi
+
+          range="HEAD"
+          if [[ -n "$previous_tag" ]]; then
+            range="${previous_tag}..HEAD"
+          fi
+
+          declare -A seen_prs=()
+          prs_file="$(mktemp)"
+          while IFS= read -r sha; do
+            while IFS=$'\t' read -r number title user url; do
+              [[ -n "${number:-}" ]] || continue
+              if [[ -n "${seen_prs[$number]+x}" ]]; then
+                continue
+              fi
+              seen_prs[$number]=1
+              printf '%s\t%s\t%s\t%s\n' "$number" "$title" "$user" "$url" >> "$prs_file"
+            done < <(
+              gh api                 -H "Accept: application/vnd.github+json"                 "/repos/${repo}/commits/${sha}/pulls"                 --jq '.[] | [.number, .title, .user.login, .html_url] | @tsv' 2>/dev/null || true
+            )
+          done < <(git rev-list --reverse "$range")
+
+          {
+            echo "## What's Changed"
+            echo
+
+            if [[ -s "$prs_file" ]]; then
+              while IFS=$'\t' read -r number title user url; do
+                echo "- ${title} by @${user} in ${url}"
+              done < "$prs_file"
+            else
+              echo "No pull requests were included in this release."
+            fi
+
+            echo
+            if [[ -n "$previous_tag" ]]; then
+              echo "**Full Changelog**: https://github.com/${repo}/compare/${previous_tag}...${tag}"
+            else
+              echo "Initial release."
+            fi
+          } > dist/release-notes.md
+          rm -f "$prs_file"
 
       - name: Create GitHub Release
         env:

@@ -8,37 +8,7 @@ use std::process::{exit, Command, Stdio};
 const APP_NAME: &str = "lazyvim";
 const DEFAULT_HOME_DIR: &str = ".lazyvim";
 
-struct StarterFile {
-    path: &'static str,
-    contents: &'static str,
-}
-
-const STARTER_FILES: &[StarterFile] = &[
-    StarterFile {
-        path: "init.lua",
-        contents: include_str!("../assets/starter/init.lua"),
-    },
-    StarterFile {
-        path: "lazyvim.json",
-        contents: include_str!("../assets/starter/lazyvim.json"),
-    },
-    StarterFile {
-        path: "lua/config/options.lua",
-        contents: include_str!("../assets/starter/lua/config/options.lua"),
-    },
-    StarterFile {
-        path: "lua/config/keymaps.lua",
-        contents: include_str!("../assets/starter/lua/config/keymaps.lua"),
-    },
-    StarterFile {
-        path: "lua/config/autocmds.lua",
-        contents: include_str!("../assets/starter/lua/config/autocmds.lua"),
-    },
-    StarterFile {
-        path: "lua/plugins/example.lua",
-        contents: include_str!("../assets/starter/lua/plugins/example.lua"),
-    },
-];
+const STARTER_REPOSITORY: &str = "https://github.com/LazyVim/starter.git";
 
 #[derive(Debug)]
 struct Cli {
@@ -106,7 +76,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         command => {
-            let runtime = prepare_runtime(cli.home, true)?;
+            let bootstrap = !matches!(command, CliCommand::Doctor | CliCommand::Where);
+            let runtime = prepare_runtime(cli.home, bootstrap)?;
             match command {
                 CliCommand::Launch(args) => launch_nvim(&runtime, &args),
                 CliCommand::Doctor => doctor(&runtime),
@@ -256,21 +227,49 @@ fn user_home_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     }
 }
 
-fn ensure_starter_config(config_dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(config_dir)?;
+fn ensure_starter_config(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if config_dir.join("init.lua").exists() {
+        return Ok(());
+    }
 
-    for starter in STARTER_FILES {
-        let target = config_dir.join(starter.path);
+    if config_dir.exists() && fs::read_dir(config_dir)?.next().transpose()?.is_some() {
+        return Err(format!(
+            "{} exists but does not contain init.lua; move it away or run `lazyvim reset --yes`",
+            config_dir.display()
+        )
+        .into());
+    }
 
-        if target.exists() {
-            continue;
-        }
+    if config_dir.exists() {
+        fs::remove_dir_all(config_dir)?;
+    }
 
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
+    let starter_repository =
+        env::var("LAZYVIM_STARTER_REPOSITORY").unwrap_or_else(|_| STARTER_REPOSITORY.to_string());
 
-        fs::write(target, starter.contents)?;
+    let output = Command::new("git")
+        .arg("clone")
+        .arg("--depth=1")
+        .arg(&starter_repository)
+        .arg(config_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "failed to clone LazyVim starter from {starter_repository}: {}{}",
+            stdout.trim(),
+            stderr.trim()
+        )
+        .into());
+    }
+
+    let git_dir = config_dir.join(".git");
+    if git_dir.exists() {
+        fs::remove_dir_all(git_dir)?;
     }
 
     Ok(())
@@ -442,6 +441,7 @@ fn print_help() {
     println!("  help       Print this help");
     println!();
     println!("Environment:");
-    println!("  LAZYVIM_HOME  Override ~/.lazyvim");
-    println!("  LAZYVIM_NVIM  Use a specific nvim executable");
+    println!("  LAZYVIM_HOME                Override ~/.lazyvim");
+    println!("  LAZYVIM_NVIM                Use a specific nvim executable");
+    println!("  LAZYVIM_STARTER_REPOSITORY  Override the LazyVim starter repository");
 }

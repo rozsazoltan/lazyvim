@@ -33,7 +33,6 @@ def main() -> int:
 
     replace_once(ROOT / "Cargo.toml", r'^version\s*=\s*"[^"]+"', f'version = "{version}"')
     replace_once(ROOT / "Cargo.lock", r'(?m)(^name\s*=\s*"lazyvim"\nversion\s*=\s*)"[^"]+"', rf'\1"{version}"')
-    (ROOT / "VERSION").write_text(f"{version}\n", encoding="utf-8")
 
     return 0
 

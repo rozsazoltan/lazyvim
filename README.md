@@ -80,14 +80,22 @@ Windows PowerShell:
 $bin = "$env:LOCALAPPDATA\Programs\lazyvim\bin"
 New-Item -ItemType Directory -Force $bin | Out-Null
 Invoke-WebRequest https://github.com/rozsazoltan/lazyvim/releases/latest/download/lazyvim-windows-x86_64.exe -OutFile "$bin\lazyvim.exe"
+
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath -notlike "*$bin*") {
+    [Environment]::SetEnvironmentVariable("Path", "$userPath;$bin", "User")
+}
+$env:Path = "$env:Path;$bin"
+
+lazyvim --version
 ```
 
-Then add `%LOCALAPPDATA%\Programs\lazyvim\bin` to your user `PATH` if it is not already there.
+The last `$env:Path` line makes `lazyvim` available in the current terminal session. New terminals will pick it up from the user `PATH`.
 
 > [!IMPORTANT]
 > The release asset is the `lazyvim` launcher executable. It manages the portable LazyVim home, but it still starts Neovim. Install Neovim normally, put `nvim` in `~/.lazyvim/bin`, or set `LAZYVIM_NVIM` if the launcher cannot find it. The first run also needs Git so the launcher can fetch the official LazyVim starter config.
 
-Release checksums are published as `SHA256SUMS` next to the executables.
+Release checksums are published as `SHA256SUMS` next to the executables. The Linux x86_64 executable is built with the musl target to avoid depending on the glibc version installed by a specific distribution.
 
 ### First run
 
@@ -205,6 +213,10 @@ The launcher sets these variables automatically before starting Neovim:
 | `XDG_CACHE_HOME` | `$LAZYVIM_HOME/cache` |
 
 ## Troubleshooting
+
+If Linux prints a glibc error such as `GLIBC_2.xx not found`, install a newer LazyVim release. Linux builds are published from the `x86_64-unknown-linux-musl` Rust target, so the launcher should not require the glibc version from the GitHub Actions runner.
+
+If Windows prints `lazyvim: program not found`, the executable is not in your `PATH` under the name `lazyvim.exe`. Download `lazyvim-windows-x86_64.exe` as `lazyvim.exe`, place it in a directory included in `PATH`, and open a new terminal.
 
 Run the built-in doctor command first:
 

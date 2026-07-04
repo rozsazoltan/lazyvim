@@ -1452,7 +1452,6 @@ fn install_neovim_command(runtime: &Runtime) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-
 fn ensure_managed_tools(
     home: &Path,
     path_value: &OsString,

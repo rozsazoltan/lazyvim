@@ -204,11 +204,11 @@ fn prepare_runtime(home_override: Option<PathBuf>, bootstrap: bool) -> Result<Ru
 
 fn resolve_home(home_override: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(path) = home_override {
-        return Ok(expand_home(path)?);
+        return expand_home(path);
     }
 
     if let Some(value) = env::var_os("LAZYVIM_HOME") {
-        return Ok(expand_home(PathBuf::from(value))?);
+        return expand_home(PathBuf::from(value));
     }
 
     Ok(user_home_dir()?.join(DEFAULT_HOME_DIR))
@@ -218,7 +218,7 @@ fn expand_home(path: PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let text = path.to_string_lossy();
 
     if text == "~" {
-        return Ok(user_home_dir()?);
+        return user_home_dir();
     }
 
     if let Some(rest) = text.strip_prefix("~/") {
@@ -248,7 +248,7 @@ fn user_home_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
     match (drive, path) {
         (Some(drive), Some(path)) => {
-            let mut combined = OsString::from(drive);
+            let mut combined = drive;
             combined.push(path);
             Ok(PathBuf::from(combined))
         }

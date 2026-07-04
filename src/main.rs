@@ -1714,10 +1714,7 @@ fn ensure_portable_lazyvim_config(config_dir: &Path) -> Result<(), Box<dyn std::
 fn remove_unsupported_portable_treesitter_config(
     config_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let portable_plugin = config_dir
-        .join("lua")
-        .join("plugins")
-        .join("portable.lua");
+    let portable_plugin = config_dir.join("lua").join("plugins").join("portable.lua");
 
     if !portable_plugin.exists() {
         return Ok(());

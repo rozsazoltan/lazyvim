@@ -1,0 +1,2 @@
+-- Autocmds are automatically loaded before LazyVim starts.
+-- Add any custom autocmds here.

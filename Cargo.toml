@@ -1,0 +1,22 @@
+[package]
+name = "lazyvim"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+authors = ["Zoltán Rózsa <rozsa.zoltan.dev@gmail.com>"]
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/rozsazoltan/lazyvim"
+description = "Portable LazyVim launcher for the truly lazy."
+readme = "README.md"
+keywords = ["neovim", "lazyvim", "portable", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "lazyvim"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

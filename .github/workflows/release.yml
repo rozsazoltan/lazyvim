@@ -12,16 +12,6 @@ on:
         required: true
         default: master
         type: string
-      neovim_version:
-        description: "Neovim release tag to bundle. Example: stable, nightly, v0.12.2"
-        required: true
-        default: stable
-        type: string
-      bundle_neovim:
-        description: "Download and include Neovim in release packages"
-        required: true
-        default: true
-        type: boolean
       draft:
         description: "Create the GitHub Release as a draft"
         required: true
@@ -145,19 +135,19 @@ jobs:
           - platform: linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            package_script: unix
+            asset: lazyvim-linux-x86_64
           - platform: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            package_script: windows
+            asset: lazyvim-windows-x86_64.exe
           - platform: macos-x86_64
             os: macos-15-intel
             target: x86_64-apple-darwin
-            package_script: unix
+            asset: lazyvim-macos-x86_64
           - platform: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
-            package_script: unix
+            asset: lazyvim-macos-arm64
     steps:
       - name: Checkout release ref
         uses: actions/checkout@v4
@@ -172,36 +162,30 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package Unix
-        if: matrix.package_script == 'unix'
+      - name: Prepare executable asset
         shell: bash
         run: |
-          chmod +x scripts/package-unix.sh
-          scripts/package-unix.sh \
-            "${{ matrix.target }}" \
-            "${{ matrix.platform }}" \
-            "${{ needs.prepare.outputs.version }}" \
-            "${{ inputs.bundle_neovim }}" \
-            "${{ inputs.neovim_version }}"
+          set -euo pipefail
+          mkdir -p dist
+          extension=""
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            extension=".exe"
+          fi
 
-      - name: Package Windows
-        if: matrix.package_script == 'windows'
-        shell: pwsh
-        run: |
-          ./scripts/package-windows.ps1 `
-            -Target "${{ matrix.target }}" `
-            -Platform "${{ matrix.platform }}" `
-            -Version "${{ needs.prepare.outputs.version }}" `
-            -BundleNeovim "${{ inputs.bundle_neovim }}" `
-            -NeovimVersion "${{ inputs.neovim_version }}"
+          source="target/${{ matrix.target }}/release/lazyvim${extension}"
+          asset="dist/${{ matrix.asset }}"
 
-      - name: Upload package artifact
+          cp "$source" "$asset"
+          if [[ "$extension" != ".exe" ]]; then
+            chmod 755 "$asset"
+          fi
+          ls -lah "$asset"
+
+      - name: Upload executable artifact
         uses: actions/upload-artifact@v4
         with:
-          name: lazyvim-${{ needs.prepare.outputs.version }}-${{ matrix.platform }}
-          path: |
-            dist/*.tar.gz
-            dist/*.zip
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
           if-no-files-found: error
           retention-days: 7
 
@@ -218,13 +202,16 @@ jobs:
           ref: ${{ needs.prepare.outputs.release_ref }}
           fetch-depth: 0
 
-      - name: Download package artifacts
+      - name: Download executable artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist/artifacts
           merge-multiple: true
 
       - name: Generate checksums and release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
@@ -252,8 +239,4 @@ jobs:
             release_flags+=(--prerelease)
           fi
 
-          gh release create "$TAG" "${assets[@]}" \
-            --target "$RELEASE_REF" \
-            --title "$TAG" \
-            --notes-file dist/release-notes.md \
-            "${release_flags[@]}"
+          gh release create "$TAG" "${assets[@]}"             --target "$RELEASE_REF"             --title "$TAG"             --notes-file dist/release-notes.md             "${release_flags[@]}"

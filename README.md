@@ -113,7 +113,7 @@ lazyvim --version
 The last `$env:Path` line makes `lazyvim` available in the current terminal session. New terminals will pick it up from the user `PATH`.
 
 > [!IMPORTANT]
-> The release asset is the `lazyvim` launcher executable. On first run, it downloads the official Neovim release into `~/.lazyvim/nvim` when no usable `nvim` is available, installs Zig into `~/.lazyvim/tools/zig` as a portable C compiler, and installs `tree-sitter` into `~/.lazyvim/bin`. The first run still needs Git to fetch the official LazyVim starter config and curl to download managed runtime files.
+> The release asset is the `lazyvim` launcher executable. On first run, it downloads the official Neovim release, installs Zig as a portable C compiler, and installs `tree-sitter` into the selected portable home. The first run still needs Git to fetch the official LazyVim starter config and curl to download managed runtime files.
 
 Release checksums are published as `SHA256SUMS` next to the executables. The Linux x86_64 executable is built with the musl target to avoid depending on the glibc version installed by a specific distribution.
 
@@ -125,11 +125,11 @@ Open any project directory and run:
 lazyvim .
 ```
 
-The first run creates the portable home, installs Neovim into `~/.lazyvim/nvim` if needed, installs Zig and tree-sitter into the portable home, fetches the official LazyVim starter config, and lets LazyVim/lazy.nvim install plugins into `~/.lazyvim`.
+The first run creates the selected portable home, installs Neovim if needed, installs Zig and tree-sitter, fetches the official LazyVim starter config, and lets LazyVim/lazy.nvim install plugins there.
 
 ### Upgrade
 
-Install a newer release by replacing the `lazyvim` executable. Your LazyVim config, plugins, state, and cache stay in `~/.lazyvim` unless you remove or change that directory.
+Install a newer release by replacing the `lazyvim` executable. Your LazyVim config, plugins, state, and cache stay in the selected portable home unless you remove or change that directory.
 
 To update LazyVim plugins after upgrading the launcher:
 
@@ -163,8 +163,8 @@ lazyvim sync      # install and sync plugins
 lazyvim restore   # restore plugins from the lockfile
 lazyvim update    # update plugins
 lazyvim clean     # remove unused plugins
-lazyvim install-nvim   # install Neovim into ~/.lazyvim/nvim
-lazyvim install-tools  # install Zig and tree-sitter into ~/.lazyvim
+lazyvim install-nvim   # install Neovim into the selected portable home
+lazyvim install-tools  # install Zig and tree-sitter into the selected portable home
 ```
 
 These commands run lazy.nvim in headless mode and use the same portable home as normal editor sessions.
@@ -183,19 +183,61 @@ Use a different location for one command:
 lazyvim --home ~/.work-lazyvim .
 ```
 
-Or persist it with an environment variable:
+Use an absolute path when you want to keep the portable home somewhere specific:
+
+```sh
+lazyvim --home /opt/lazyvim .
+```
+
+Windows PowerShell:
+
+```powershell
+lazyvim --home D:\Tools\lazyvim-home .
+```
+
+To keep `.lazyvim` next to the launcher executable, use portable-home mode:
+
+```sh
+lazyvim --portable-home .
+lazyvim --home portable .
+```
+
+For a persistent executable-local home, set `LAZYVIM_HOME` to `portable`:
+
+```sh
+LAZYVIM_HOME=portable lazyvim .
+```
+
+The aliases `portable`, `self`, `exe`, and `launcher` all resolve to:
+
+```text
+<launcher-directory>/.lazyvim
+```
+
+You can also persist any custom path with an environment variable:
 
 ```sh
 LAZYVIM_HOME=~/.work-lazyvim lazyvim .
 ```
 
+When you switch from the default `~/.lazyvim` home to a custom home, the launcher moves the existing default home automatically if the target directory does not exist yet:
+
+```sh
+LAZYVIM_HOME=/opt/lazyvim lazyvim .
+lazyvim --home /opt/lazyvim .
+lazyvim --portable-home .
+```
+
+This keeps existing config, plugins, Neovim, managed tools, cache, state, and Mason packages instead of starting from an empty profile. If the target home already exists, the launcher does not overwrite it.
+
 Print the resolved locations:
 
 ```sh
 lazyvim where
+lazyvim --portable-home where
 ```
 
-Reset the portable home:
+Reset the selected portable home:
 
 ```sh
 lazyvim reset --yes
@@ -211,11 +253,11 @@ The launcher looks for Neovim in this order:
 1. `LAZYVIM_NVIM`
 2. `nvim/bin/nvim` next to the launcher executable
 3. `bin/nvim` next to the launcher executable
-4. `~/.lazyvim/nvim/bin/nvim`
-5. `~/.lazyvim/bin/nvim`
+4. `$LAZYVIM_HOME/nvim/bin/nvim`
+5. `$LAZYVIM_HOME/bin/nvim`
 6. `nvim` from `PATH`
 
-If none of these works during a normal launch, the launcher downloads the official Neovim release for the current platform into `~/.lazyvim/nvim` and then starts it from there. You can also install it explicitly:
+If none of these works during a normal launch, the launcher downloads the official Neovim release for the current platform into the selected portable home and then starts it from there. You can also install it explicitly:
 
 ```sh
 lazyvim install-nvim
@@ -229,8 +271,8 @@ This keeps the release itself as a single executable while still giving users a 
 LazyVim needs a small amount of external tooling during the first plugin install. The launcher manages the tools that are needed for the default Treesitter path:
 
 ```text
-~/.lazyvim/tools/zig        # portable C compiler
-~/.lazyvim/bin/tree-sitter  # tree-sitter CLI
+$LAZYVIM_HOME/tools/zig        # portable C compiler
+$LAZYVIM_HOME/bin/tree-sitter  # tree-sitter CLI
 ```
 
 Install or repair them explicitly:
@@ -245,7 +287,7 @@ The managed tool directories are prepended to `PATH` when Neovim is started, so 
 
 | Variable | Description |
 |---|---|
-| `LAZYVIM_HOME` | Overrides the default `~/.lazyvim` portable home. |
+| `LAZYVIM_HOME` | Overrides the default `~/.lazyvim` portable home. Use `portable`, `self`, `exe`, or `launcher` to store `.lazyvim` next to the launcher executable. |
 | `LAZYVIM_NVIM` | Uses a specific Neovim executable. |
 | `LAZYVIM_STARTER_REPOSITORY` | Overrides the LazyVim starter repository used for first-run bootstrap. |
 
@@ -273,7 +315,7 @@ Run the built-in doctor command first:
 lazyvim doctor
 ```
 
-The first run needs Git to clone the LazyVim starter config. The launcher installs Neovim, Zig, and tree-sitter into `~/.lazyvim`, but LazyVim extras may still need project-specific tools such as language runtimes, package managers, formatters, linters, and LSP servers.
+The first run needs Git to clone the LazyVim starter config. The launcher installs Neovim, Zig, and tree-sitter into the selected portable home, but LazyVim extras may still need project-specific tools such as language runtimes, package managers, formatters, linters, and LSP servers.
 
 If Neovim or the managed Treesitter tools cannot be found, run the built-in installers or point the launcher to a binary:
 
@@ -283,7 +325,7 @@ lazyvim install-tools
 LAZYVIM_NVIM=/path/to/nvim lazyvim .
 ```
 
-The automatic installers download the official Neovim release asset, the Zig release asset, and the tree-sitter CLI release asset for the current platform, then extract them into `~/.lazyvim`.
+The automatic installers download the official Neovim release asset, the Zig release asset, and the tree-sitter CLI release asset for the current platform, then extract them into the selected portable home.
 
 If you want a completely fresh LazyVim profile:
 

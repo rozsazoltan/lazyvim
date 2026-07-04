@@ -15,6 +15,7 @@ const TREE_SITTER_VERSION: &str = "0.26.10";
 #[derive(Debug)]
 struct Cli {
     home: Option<PathBuf>,
+    portable_home: bool,
     command: CliCommand,
 }
 
@@ -67,7 +68,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         CliCommand::Reset { yes } => {
-            let runtime = prepare_runtime(cli.home, false)?;
+            let runtime = prepare_runtime(cli.home, cli.portable_home, false, false)?;
             if !yes {
                 println!("This will delete: {}", runtime.home.display());
                 println!("Run `lazyvim reset --yes` to confirm.");
@@ -81,7 +82,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         command => {
             let bootstrap = !matches!(command, CliCommand::Doctor | CliCommand::Where);
-            let runtime = prepare_runtime(cli.home, bootstrap)?;
+            let runtime = prepare_runtime(cli.home, cli.portable_home, bootstrap, true)?;
             match command {
                 CliCommand::Launch(args) => launch_nvim(&runtime, &args),
                 CliCommand::Doctor => doctor(&runtime),
@@ -100,6 +101,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn parse_cli(mut args: Vec<String>) -> Cli {
     let mut home = None;
+    let mut portable_home = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -116,6 +118,12 @@ fn parse_cli(mut args: Vec<String>) -> Cli {
 
         if let Some(value) = arg.strip_prefix("--home=") {
             home = Some(PathBuf::from(value));
+            args.remove(index);
+            continue;
+        }
+
+        if arg == "--portable" || arg == "--portable-home" {
+            portable_home = true;
             args.remove(index);
             continue;
         }
@@ -140,11 +148,30 @@ fn parse_cli(mut args: Vec<String>) -> Cli {
         _ => CliCommand::Launch(args),
     };
 
-    Cli { home, command }
+    Cli {
+        home,
+        portable_home,
+        command,
+    }
 }
 
-fn prepare_runtime(home_override: Option<PathBuf>, bootstrap: bool) -> Result<Runtime, Box<dyn std::error::Error>> {
-    let home = resolve_home(home_override)?;
+fn prepare_runtime(
+    home_override: Option<PathBuf>,
+    portable_home: bool,
+    bootstrap: bool,
+    migrate_custom_home: bool,
+) -> Result<Runtime, Box<dyn std::error::Error>> {
+    let exe_dir = env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+
+    let uses_custom_home = portable_home || home_override.is_some() || env::var_os("LAZYVIM_HOME").is_some();
+    let home = resolve_home(home_override, portable_home, exe_dir.as_deref())?;
+
+    if migrate_custom_home && uses_custom_home {
+        migrate_default_home_if_needed(&home)?;
+    }
+
     let config_home = home.join("config");
     let data_home = home.join("data");
     let state_home = home.join("state");
@@ -156,10 +183,6 @@ fn prepare_runtime(home_override: Option<PathBuf>, bootstrap: bool) -> Result<Ru
     fs::create_dir_all(&data_home)?;
     fs::create_dir_all(&state_home)?;
     fs::create_dir_all(&cache_home)?;
-
-    let exe_dir = env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
 
     let path_value = build_path(&home, exe_dir.as_deref())?;
     let mut nvim = resolve_nvim(&home, exe_dir.as_deref());
@@ -195,36 +218,168 @@ fn prepare_runtime(home_override: Option<PathBuf>, bootstrap: bool) -> Result<Ru
     })
 }
 
-fn resolve_home(home_override: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn resolve_home(
+    home_override: Option<PathBuf>,
+    portable_home: bool,
+    exe_dir: Option<&Path>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if portable_home {
+        return home_next_to_executable(exe_dir);
+    }
+
     if let Some(path) = home_override {
-        return expand_home(path);
+        return expand_home(path, exe_dir);
     }
 
     if let Some(value) = env::var_os("LAZYVIM_HOME") {
-        return expand_home(PathBuf::from(value));
+        return expand_home(PathBuf::from(value), exe_dir);
     }
 
     Ok(user_home_dir()?.join(DEFAULT_HOME_DIR))
 }
 
-fn expand_home(path: PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn expand_home(path: PathBuf, exe_dir: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let text = path.to_string_lossy();
 
-    if text == "~" {
-        return user_home_dir();
+    if is_portable_home_alias(&text) {
+        return home_next_to_executable(exe_dir);
     }
 
-    if let Some(rest) = text.strip_prefix("~/") {
-        return Ok(user_home_dir()?.join(rest));
-    }
-
-    if cfg!(windows) {
+    let expanded = if text == "~" {
+        user_home_dir()?
+    } else if let Some(rest) = text.strip_prefix("~/") {
+        user_home_dir()?.join(rest)
+    } else if cfg!(windows) {
         if let Some(rest) = text.strip_prefix("~\\") {
-            return Ok(user_home_dir()?.join(rest));
+            user_home_dir()?.join(rest)
+        } else {
+            PathBuf::from(text.as_ref())
+        }
+    } else {
+        PathBuf::from(text.as_ref())
+    };
+
+    absolute_path(expanded)
+}
+
+fn is_portable_home_alias(value: &str) -> bool {
+    matches!(value, "portable" | "self" | "exe" | "launcher")
+}
+
+fn home_next_to_executable(exe_dir: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let exe_dir = exe_dir.ok_or("could not resolve launcher executable directory")?;
+    Ok(exe_dir.join(DEFAULT_HOME_DIR))
+}
+
+fn migrate_default_home_if_needed(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let source = user_home_dir()?.join(DEFAULT_HOME_DIR);
+    let source = absolute_path(source)?;
+    let destination = absolute_path(destination.to_path_buf())?;
+
+    if source == destination || !source.exists() || destination.exists() {
+        return Ok(());
+    }
+
+    if destination.starts_with(&source) {
+        return Err(format!(
+            "cannot move {} into itself at {}",
+            source.display(),
+            destination.display()
+        )
+        .into());
+    }
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    println!(
+        "Moving portable home from {} to {}",
+        source.display(),
+        destination.display()
+    );
+
+    move_directory(&source, &destination)?;
+    Ok(())
+}
+
+fn move_directory(source: &Path, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            copy_directory(source, destination).map_err(|copy_error| {
+                format!(
+                    "failed to move {} to {}: rename failed with {}; copy fallback failed with {}",
+                    source.display(),
+                    destination.display(),
+                    rename_error,
+                    copy_error
+                )
+            })?;
+            fs::remove_dir_all(source)?;
+            Ok(())
+        }
+    }
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::create_dir_all(destination)?;
+
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            copy_directory(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &destination_path)?;
+        } else if file_type.is_symlink() {
+            copy_symlink(&source_path, &destination_path)?;
         }
     }
 
-    Ok(PathBuf::from(text.as_ref()))
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let target = fs::read_link(source)?;
+    if destination.exists() {
+        fs::remove_file(destination)?;
+    }
+    symlink(target, destination)
+}
+
+#[cfg(windows)]
+fn copy_symlink(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+
+    let target = fs::read_link(source)?;
+    if destination.exists() {
+        if destination.is_dir() {
+            fs::remove_dir(destination)?;
+        } else {
+            fs::remove_file(destination)?;
+        }
+    }
+
+    if source.is_dir() {
+        symlink_dir(target, destination)
+    } else {
+        symlink_file(target, destination)
+    }
+}
+
+fn absolute_path(path: PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(env::current_dir()?.join(path))
+    }
 }
 
 fn user_home_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -953,8 +1108,12 @@ fn print_help() {
     println!("lazyvim {}", env!("CARGO_PKG_VERSION"));
     println!();
     println!("Usage:");
-    println!("  lazyvim [--home <path>] [nvim args...]");
-    println!("  lazyvim [--home <path>] <command>");
+    println!("  lazyvim [--home <path>] [--portable-home] [nvim args...]");
+    println!("  lazyvim [--home <path>] [--portable-home] <command>");
+    println!();
+    println!("Options:");
+    println!("  --home <path>      Use a custom portable home for this run");
+    println!("  --portable-home    Store .lazyvim next to the launcher executable");
     println!();
     println!("Commands:");
     println!("  where      Print resolved portable directories");
@@ -969,7 +1128,7 @@ fn print_help() {
     println!("  help       Print this help");
     println!();
     println!("Environment:");
-    println!("  LAZYVIM_HOME                Override ~/.lazyvim");
+    println!("  LAZYVIM_HOME                Override ~/.lazyvim; use 'portable' for executable-local home");
     println!("  LAZYVIM_NVIM                Use a specific nvim executable");
     println!("  LAZYVIM_STARTER_REPOSITORY  Override the LazyVim starter repository");
 }

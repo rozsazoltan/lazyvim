@@ -13,6 +13,7 @@ const ZIG_VERSION: &str = "0.14.0";
 const TREE_SITTER_VERSION: &str = "0.26.10";
 const RIPGREP_VERSION: &str = "15.1.0";
 const FD_VERSION: &str = "10.4.2";
+const FD_MACOS_X86_64_VERSION: &str = "10.3.0";
 const LAZYGIT_VERSION: &str = "0.62.2";
 const PORTABLE_TOOLCHAIN_STAMP: &str = "2026-07-04-portable-cc-v2";
 
@@ -1046,23 +1047,26 @@ fn ripgrep_release_asset() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn install_fd(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let asset = fd_release_asset()?;
-    let url = format!("https://github.com/sharkdp/fd/releases/download/v{FD_VERSION}/{asset}");
+    let (version, asset) = fd_release_asset()?;
+    let url = format!("https://github.com/sharkdp/fd/releases/download/v{version}/{asset}");
     install_single_binary_from_archive(home, "fd", &url, &asset, if cfg!(windows) { "fd.exe" } else { "fd" })
 }
 
-fn fd_release_asset() -> Result<String, Box<dyn std::error::Error>> {
+fn fd_release_asset() -> Result<(&'static str, String), Box<dyn std::error::Error>> {
     if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
-        return Ok(format!("fd-v{FD_VERSION}-x86_64-pc-windows-msvc.zip"));
+        return Ok((FD_VERSION, format!("fd-v{FD_VERSION}-x86_64-pc-windows-msvc.zip")));
     }
     if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        return Ok(format!("fd-v{FD_VERSION}-x86_64-unknown-linux-musl.tar.gz"));
+        return Ok((FD_VERSION, format!("fd-v{FD_VERSION}-x86_64-unknown-linux-musl.tar.gz")));
     }
     if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
-        return Ok(format!("fd-v{FD_VERSION}-x86_64-apple-darwin.tar.gz"));
+        return Ok((
+            FD_MACOS_X86_64_VERSION,
+            format!("fd-v{FD_MACOS_X86_64_VERSION}-x86_64-apple-darwin.tar.gz"),
+        ));
     }
     if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        return Ok(format!("fd-v{FD_VERSION}-aarch64-apple-darwin.tar.gz"));
+        return Ok((FD_VERSION, format!("fd-v{FD_VERSION}-aarch64-apple-darwin.tar.gz")));
     }
     Err("automatic fd installation is not supported on this platform".into())
 }

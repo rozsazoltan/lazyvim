@@ -310,23 +310,23 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $exe = Resolve-Path "smoke-bin/${{ matrix.asset }}"
-          $home = Join-Path $env:RUNNER_TEMP "lazyvim-home"
-          Remove-Item -Recurse -Force $home -ErrorAction SilentlyContinue
+          $lazyvimHome = Join-Path $env:RUNNER_TEMP "lazyvim-home"
+          Remove-Item -Recurse -Force $lazyvimHome -ErrorAction SilentlyContinue
 
           & $exe --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          & $exe --home $home install-deps
+          & $exe --home $lazyvimHome install-deps
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          & $exe --home $home doctor 2>&1 | Tee-Object -FilePath doctor.log
+          & $exe --home $lazyvimHome doctor 2>&1 | Tee-Object -FilePath doctor.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (Select-String -Path doctor.log -SimpleMatch "[fail]") { exit 1 }
 
-          & $exe --home $home sync
+          & $exe --home $lazyvimHome sync
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          & $exe --home $home doctor 2>&1 | Tee-Object -FilePath doctor-after-sync.log
+          & $exe --home $lazyvimHome doctor 2>&1 | Tee-Object -FilePath doctor-after-sync.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (Select-String -Path doctor-after-sync.log -SimpleMatch "[fail]") { exit 1 }
 

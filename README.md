@@ -358,7 +358,7 @@ lazyvim install-tools
 LAZYVIM_NVIM=/path/to/nvim lazyvim .
 ```
 
-The automatic installers download the official Neovim, Zig, tree-sitter CLI, ripgrep, fd, and lazygit release assets for the current platform, then extract them into the selected portable home. Linux uses musl/static-style assets where those projects provide them.
+The automatic installers download the official Neovim, Zig, ripgrep, fd, and lazygit release assets for the current platform, then extract them into the selected portable home. Linux release builds embed a launcher-tested tree-sitter CLI so older glibc-based distributions and musl-based distributions do not depend on the upstream tree-sitter Linux binary. Other platforms download the official tree-sitter CLI asset.
 
 If you want a completely fresh LazyVim profile:
 

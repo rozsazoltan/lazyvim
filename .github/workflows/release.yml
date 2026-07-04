@@ -216,7 +216,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      - name: Build embedded tree-sitter CLI
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install tree-sitter-cli --version 0.26.10 --locked --target x86_64-unknown-linux-musl --root "${RUNNER_TEMP}/tree-sitter-cli"
+
       - name: Build
+        env:
+          LAZYVIM_EMBED_TREE_SITTER: ${{ runner.temp }}/tree-sitter-cli/bin/tree-sitter
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Prepare executable asset
@@ -298,7 +307,10 @@ jobs:
           if grep -F "[fail]" doctor.log; then
             exit 1
           fi
-          "$exe" --home "$home" sync
+          "$exe" --home "$home" sync 2>&1 | tee sync.log
+          if grep -E "nvim-treesitter/install/.*error|Failed to compile parser|UnknownOperatingSystem" sync.log; then
+            exit 1
+          fi
           "$exe" --home "$home" doctor 2>&1 | tee doctor-after-sync.log
           if grep -F "[fail]" doctor-after-sync.log; then
             exit 1
@@ -323,8 +335,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (Select-String -Path doctor.log -SimpleMatch "[fail]") { exit 1 }
 
-          & $exe --home $lazyvimHome sync
+          & $exe --home $lazyvimHome sync 2>&1 | Tee-Object -FilePath sync.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Select-String -Path sync.log -Pattern "nvim-treesitter/install/.*error|Failed to compile parser|UnknownOperatingSystem") { exit 1 }
 
           & $exe --home $lazyvimHome doctor 2>&1 | Tee-Object -FilePath doctor-after-sync.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -342,7 +355,7 @@ jobs:
       matrix:
         include:
           - distro: alpine
-            image: alpine:3.20
+            image: alpine:edge
           - distro: debian
             image: debian:12-slim
           - distro: arch
@@ -381,7 +394,10 @@ jobs:
               if grep -F "[fail]" /tmp/doctor.log; then
                 exit 1
               fi
-              /tmp/lazyvim --home "$home" sync
+              /tmp/lazyvim --home "$home" sync 2>&1 | tee /tmp/sync.log
+              if grep -E "nvim-treesitter/install/.*error|Failed to compile parser|UnknownOperatingSystem" /tmp/sync.log; then
+                exit 1
+              fi
               /tmp/lazyvim --home "$home" doctor 2>&1 | tee /tmp/doctor-after-sync.log
               if grep -F "[fail]" /tmp/doctor-after-sync.log; then
                 exit 1

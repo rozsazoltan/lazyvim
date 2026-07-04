@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       target_branch:
-        description: "Branch to release from and squash-merge version updates into"
+        description: "Branch to release from and squash version updates into"
         required: true
         default: master
         type: string
@@ -35,7 +35,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 concurrency:
   group: release-${{ inputs.target_branch }}-${{ inputs.version }}
@@ -46,7 +45,7 @@ env:
 
 jobs:
   prepare:
-    name: Prepare release branch
+    name: Prepare release
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
@@ -100,51 +99,30 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create release branch and squash merge
+      - name: Squash version changes into target branch
         if: steps.diff.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.meta.outputs.version }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
         shell: bash
         run: |
           set -euo pipefail
-          branch="chore/release-${VERSION}"
+          release_branch="chore/release-${VERSION}"
           title="chore(release): ${VERSION}"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -B "$branch"
+
+          git checkout -B "$release_branch"
           git add Cargo.toml Cargo.lock VERSION
           git commit -m "$title"
-          git push --force-with-lease origin "$branch"
+          git push --force origin "HEAD:${release_branch}"
 
-          pr_number="$(gh pr list \
-            --state open \
-            --head "$branch" \
-            --base "$TARGET_BRANCH" \
-            --json number \
-            --jq '.[0].number // empty')"
-
-          if [[ -z "$pr_number" ]]; then
-            gh pr create \
-              --base "$TARGET_BRANCH" \
-              --head "$branch" \
-              --title "$title" \
-              --body "Automated release preparation for ${VERSION}."
-            pr_number="$(gh pr list \
-              --state open \
-              --head "$branch" \
-              --base "$TARGET_BRANCH" \
-              --json number \
-              --jq '.[0].number')"
-          fi
-
-          gh pr merge "$pr_number" \
-            --squash \
-            --delete-branch \
-            --subject "$title" \
-            --body "Automated release preparation for ${VERSION}."
+          git fetch origin "$TARGET_BRANCH"
+          git checkout -B "$TARGET_BRANCH" "origin/${TARGET_BRANCH}"
+          git merge --squash "$release_branch"
+          git commit -m "$title"
+          git push origin "HEAD:${TARGET_BRANCH}"
 
       - name: Resolve release ref
         id: final

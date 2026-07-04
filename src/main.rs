@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};
 
@@ -22,10 +22,56 @@ const EMBEDDED_TREE_SITTER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/em
 struct Cli {
     home: Option<PathBuf>,
     portable_home: bool,
+    user_home: bool,
+    home_action: HomeSwitchAction,
     command: CliCommand,
 }
 
 #[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeSwitchAction {
+    Prompt,
+    Move,
+    StartNew,
+    DeleteOld,
+    KeepRemembered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeSource {
+    CliHome,
+    PortableFlag,
+    UserHomeFlag,
+    Environment,
+    Remembered,
+    Default,
+}
+
+#[derive(Debug)]
+struct HomeSelection {
+    path: PathBuf,
+    source: HomeSource,
+    remembered: Option<PathBuf>,
+}
+
+enum HomeConflictResolution {
+    Move,
+    StartNew,
+    DeleteOld,
+    KeepRemembered,
+}
+
+enum HomeRegistryWrite {
+    Written,
+    Failed(String),
+}
+
+enum HomeComparison {
+    Same,
+    Different,
+    Unknown,
+}
+
 enum CliCommand {
     Launch(Vec<String>),
     Doctor,
@@ -73,9 +119,15 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = parse_cli(env::args().skip(1).collect());
+    let Cli {
+        home,
+        portable_home,
+        user_home,
+        home_action,
+        command,
+    } = parse_cli(env::args().skip(1).collect());
 
-    match cli.command {
+    match command {
         CliCommand::Help => {
             print_help();
             Ok(())
@@ -85,7 +137,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         CliCommand::Reset { yes } => {
-            let runtime = prepare_runtime(cli.home, cli.portable_home, false, false)?;
+            let runtime = prepare_runtime(home, portable_home, user_home, home_action, false, false)?;
             if !yes {
                 println!("This will delete: {}", runtime.home.display());
                 println!("Run `lazyvim reset --yes` to confirm.");
@@ -102,7 +154,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 command,
                 CliCommand::Launch(_) | CliCommand::Sync | CliCommand::Restore | CliCommand::Update | CliCommand::Clean
             );
-            let runtime = prepare_runtime(cli.home, cli.portable_home, bootstrap, true)?;
+            let runtime = prepare_runtime(home, portable_home, user_home, home_action, bootstrap, true)?;
             match command {
                 CliCommand::Launch(args) => launch_nvim(&runtime, &args),
                 CliCommand::Doctor => doctor(&runtime),
@@ -123,6 +175,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn parse_cli(mut args: Vec<String>) -> Cli {
     let mut home = None;
     let mut portable_home = false;
+    let mut user_home = false;
+    let mut home_action = HomeSwitchAction::Prompt;
     let mut index = 0;
 
     while index < args.len() {
@@ -145,6 +199,36 @@ fn parse_cli(mut args: Vec<String>) -> Cli {
 
         if arg == "--portable" || arg == "--portable-home" {
             portable_home = true;
+            args.remove(index);
+            continue;
+        }
+
+        if arg == "--user-home" {
+            user_home = true;
+            args.remove(index);
+            continue;
+        }
+
+        if arg == "--move-home" {
+            home_action = HomeSwitchAction::Move;
+            args.remove(index);
+            continue;
+        }
+
+        if arg == "--new-home" || arg == "--start-new-home" {
+            home_action = HomeSwitchAction::StartNew;
+            args.remove(index);
+            continue;
+        }
+
+        if arg == "--delete-old-home" {
+            home_action = HomeSwitchAction::DeleteOld;
+            args.remove(index);
+            continue;
+        }
+
+        if arg == "--keep-home" {
+            home_action = HomeSwitchAction::KeepRemembered;
             args.remove(index);
             continue;
         }
@@ -173,6 +257,8 @@ fn parse_cli(mut args: Vec<String>) -> Cli {
     Cli {
         home,
         portable_home,
+        user_home,
+        home_action,
         command,
     }
 }
@@ -180,19 +266,17 @@ fn parse_cli(mut args: Vec<String>) -> Cli {
 fn prepare_runtime(
     home_override: Option<PathBuf>,
     portable_home: bool,
+    user_home: bool,
+    home_action: HomeSwitchAction,
     bootstrap: bool,
-    migrate_custom_home: bool,
+    remember_home: bool,
 ) -> Result<Runtime, Box<dyn std::error::Error>> {
     let exe_dir = env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf));
 
-    let uses_custom_home = portable_home || home_override.is_some() || env::var_os("LAZYVIM_HOME").is_some();
-    let home = resolve_home(home_override, portable_home, exe_dir.as_deref())?;
-
-    if migrate_custom_home && uses_custom_home {
-        migrate_default_home_if_needed(&home)?;
-    }
+    let selection = resolve_home_selection(home_override, portable_home, user_home, exe_dir.as_deref())?;
+    let home = resolve_home_switch(selection, home_action, exe_dir.as_deref(), remember_home)?;
 
     let config_home = home.join("config");
     let data_home = home.join("data");
@@ -244,24 +328,333 @@ fn prepare_runtime(
     })
 }
 
-fn resolve_home(
+fn resolve_home_selection(
     home_override: Option<PathBuf>,
     portable_home: bool,
+    user_home: bool,
     exe_dir: Option<&Path>,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+) -> Result<HomeSelection, Box<dyn std::error::Error>> {
+    let remembered = read_remembered_home(exe_dir)?;
+
     if portable_home {
-        return home_next_to_executable(exe_dir);
+        return Ok(HomeSelection {
+            path: home_next_to_executable(exe_dir)?,
+            source: HomeSource::PortableFlag,
+            remembered,
+        });
+    }
+
+    if user_home {
+        return Ok(HomeSelection {
+            path: default_home()?,
+            source: HomeSource::UserHomeFlag,
+            remembered,
+        });
     }
 
     if let Some(path) = home_override {
-        return expand_home(path, exe_dir);
+        return Ok(HomeSelection {
+            path: expand_home(path, exe_dir)?,
+            source: HomeSource::CliHome,
+            remembered,
+        });
     }
 
     if let Some(value) = env::var_os("LAZYVIM_HOME") {
-        return expand_home(PathBuf::from(value), exe_dir);
+        let value = PathBuf::from(value);
+        let text = value.to_string_lossy();
+        let path = if is_user_home_alias(&text) {
+            default_home()?
+        } else {
+            expand_home(value, exe_dir)?
+        };
+
+        return Ok(HomeSelection {
+            path,
+            source: HomeSource::Environment,
+            remembered,
+        });
     }
 
-    Ok(user_home_dir()?.join(DEFAULT_HOME_DIR))
+    if let Some(remembered) = remembered.clone() {
+        return Ok(HomeSelection {
+            path: remembered,
+            source: HomeSource::Remembered,
+            remembered,
+        });
+    }
+
+    Ok(HomeSelection {
+        path: default_home()?,
+        source: HomeSource::Default,
+        remembered,
+    })
+}
+
+fn default_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    absolute_path(user_home_dir()?.join(DEFAULT_HOME_DIR))
+}
+
+fn resolve_home_switch(
+    selection: HomeSelection,
+    action: HomeSwitchAction,
+    exe_dir: Option<&Path>,
+    remember_home: bool,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let selected = absolute_path(selection.path.clone())?;
+    let previous = previous_home_for_selection(&selection, &selected)?;
+
+    if let Some(previous) = previous {
+        if homes_are_same(&previous, &selected) != HomeComparison::Same {
+            let resolution = resolve_home_conflict(&previous, &selected, action)?;
+
+            match resolution {
+                HomeConflictResolution::Move => {
+                    move_remembered_home(&previous, &selected)?;
+                    remember_home_if_requested(&selected, exe_dir, remember_home)?;
+                    return Ok(selected);
+                }
+                HomeConflictResolution::StartNew => {
+                    remember_home_if_requested(&selected, exe_dir, remember_home)?;
+                    return Ok(selected);
+                }
+                HomeConflictResolution::DeleteOld => {
+                    delete_previous_home(&previous, &selected)?;
+                    remember_home_if_requested(&selected, exe_dir, remember_home)?;
+                    return Ok(selected);
+                }
+                HomeConflictResolution::KeepRemembered => {
+                    remember_home_if_requested(&previous, exe_dir, remember_home)?;
+                    return Ok(previous);
+                }
+            }
+        }
+    }
+
+    remember_home_if_requested(&selected, exe_dir, remember_home)?;
+    Ok(selected)
+}
+
+fn previous_home_for_selection(
+    selection: &HomeSelection,
+    selected: &Path,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    if matches!(selection.source, HomeSource::Remembered | HomeSource::Default) {
+        return Ok(None);
+    }
+
+    if let Some(remembered) = &selection.remembered {
+        return Ok(Some(absolute_path(remembered.clone())?));
+    }
+
+    let default = default_home()?;
+    if default.exists() && homes_are_same(&default, selected) != HomeComparison::Same {
+        return Ok(Some(default));
+    }
+
+    Ok(None)
+}
+
+fn resolve_home_conflict(
+    previous: &Path,
+    selected: &Path,
+    action: HomeSwitchAction,
+) -> Result<HomeConflictResolution, Box<dyn std::error::Error>> {
+    match action {
+        HomeSwitchAction::Move => return Ok(HomeConflictResolution::Move),
+        HomeSwitchAction::StartNew => return Ok(HomeConflictResolution::StartNew),
+        HomeSwitchAction::DeleteOld => return Ok(HomeConflictResolution::DeleteOld),
+        HomeSwitchAction::KeepRemembered => return Ok(HomeConflictResolution::KeepRemembered),
+        HomeSwitchAction::Prompt => {}
+    }
+
+    if !should_prompt_for_home_switch() {
+        return Err(format!(
+            "portable home is already remembered at {}; requested {}; rerun with --move-home, --new-home, --delete-old-home, or --keep-home",
+            previous.display(),
+            selected.display()
+        )
+        .into());
+    }
+
+    prompt_home_conflict(previous, selected)
+}
+
+fn should_prompt_for_home_switch() -> bool {
+    env::var_os("CI").is_none() && env::var_os("GITHUB_ACTIONS").is_none()
+}
+
+fn prompt_home_conflict(
+    previous: &Path,
+    selected: &Path,
+) -> Result<HomeConflictResolution, Box<dyn std::error::Error>> {
+    println!("A different LazyVim home is already remembered.");
+    println!("current: {}", previous.display());
+    println!("new:     {}", selected.display());
+    println!();
+    println!("Choose what to do:");
+    println!("  m  move the current home to the new path");
+    println!("  n  start a new home at the new path and keep the old one");
+    println!("  d  delete the old home and start at the new path");
+    println!("  k  keep using the remembered home");
+    println!("  a  abort");
+    print!("Selection [a]: ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    match input.trim().to_ascii_lowercase().as_str() {
+        "m" | "move" => Ok(HomeConflictResolution::Move),
+        "n" | "new" | "start" => Ok(HomeConflictResolution::StartNew),
+        "d" | "delete" => Ok(HomeConflictResolution::DeleteOld),
+        "k" | "keep" => Ok(HomeConflictResolution::KeepRemembered),
+        "a" | "abort" | "" => Err("aborted home switch".into()),
+        value => Err(format!("unknown home switch selection: {value}").into()),
+    }
+}
+
+fn move_remembered_home(previous: &Path, selected: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !previous.exists() {
+        return Err(format!("cannot move {}; it does not exist", previous.display()).into());
+    }
+
+    if selected.exists() {
+        return Err(format!("cannot move to {}; destination already exists", selected.display()).into());
+    }
+
+    if selected.starts_with(previous) {
+        return Err(format!(
+            "cannot move {} into itself at {}",
+            previous.display(),
+            selected.display()
+        )
+        .into());
+    }
+
+    if let Some(parent) = selected.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    println!(
+        "Moving portable home from {} to {}",
+        previous.display(),
+        selected.display()
+    );
+
+    move_directory(previous, selected)
+}
+
+fn delete_previous_home(previous: &Path, selected: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !previous.exists() {
+        return Ok(());
+    }
+
+    if selected.starts_with(previous) {
+        return Err(format!(
+            "cannot delete {}; selected home {} is inside it",
+            previous.display(),
+            selected.display()
+        )
+        .into());
+    }
+
+    println!("Deleting previous portable home at {}", previous.display());
+    fs::remove_dir_all(previous)?;
+    Ok(())
+}
+
+fn remember_home_if_requested(
+    home: &Path,
+    exe_dir: Option<&Path>,
+    remember_home: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !remember_home {
+        return Ok(());
+    }
+
+    match write_remembered_home(home, exe_dir) {
+        HomeRegistryWrite::Written => Ok(()),
+        HomeRegistryWrite::Failed(error) => Err(error.into()),
+    }
+}
+
+fn read_remembered_home(exe_dir: Option<&Path>) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    for path in home_registry_candidates(exe_dir)? {
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                let value = content
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty() && !line.starts_with('#'));
+
+                if let Some(value) = value {
+                    return Ok(Some(expand_home(PathBuf::from(value), exe_dir)?));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+
+    Ok(None)
+}
+
+fn write_remembered_home(home: &Path, exe_dir: Option<&Path>) -> HomeRegistryWrite {
+    let content = format!("# Managed by lazyvim.\n{}\n", home.display());
+    let mut last_error = None;
+
+    for path in match home_registry_candidates(exe_dir) {
+        Ok(paths) => paths,
+        Err(error) => return HomeRegistryWrite::Failed(error.to_string()),
+    } {
+        match path.parent().map(fs::create_dir_all) {
+            Some(Ok(())) | None => {}
+            Some(Err(error)) => {
+                last_error = Some(format!("{}: {}", path.display(), error));
+                continue;
+            }
+        }
+
+        match fs::write(&path, &content) {
+            Ok(()) => return HomeRegistryWrite::Written,
+            Err(error) => last_error = Some(format!("{}: {}", path.display(), error)),
+        }
+    }
+
+    HomeRegistryWrite::Failed(format!(
+        "failed to remember portable home: {}",
+        last_error.unwrap_or_else(|| String::from("no registry location is available"))
+    ))
+}
+
+fn home_registry_candidates(exe_dir: Option<&Path>) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut paths = Vec::new();
+
+    if let Some(exe_dir) = exe_dir {
+        paths.push(exe_dir.join(".lazyvim-home"));
+    }
+
+    paths.push(user_home_dir()?.join(".lazyvim-home"));
+    Ok(paths)
+}
+
+fn homes_are_same(left: &Path, right: &Path) -> HomeComparison {
+    let left_abs = absolute_path(left.to_path_buf());
+    let right_abs = absolute_path(right.to_path_buf());
+
+    match (left_abs, right_abs) {
+        (Ok(left), Ok(right)) if left == right => HomeComparison::Same,
+        (Ok(left), Ok(right)) => {
+            let left_canon = fs::canonicalize(&left);
+            let right_canon = fs::canonicalize(&right);
+            match (left_canon, right_canon) {
+                (Ok(left), Ok(right)) if left == right => HomeComparison::Same,
+                _ => HomeComparison::Different,
+            }
+        }
+        _ => HomeComparison::Unknown,
+    }
 }
 
 fn expand_home(path: PathBuf, exe_dir: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -292,41 +685,13 @@ fn is_portable_home_alias(value: &str) -> bool {
     matches!(value, "portable" | "self" | "exe" | "launcher")
 }
 
+fn is_user_home_alias(value: &str) -> bool {
+    matches!(value, "user" | "user-home" | "home" | "default")
+}
+
 fn home_next_to_executable(exe_dir: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let exe_dir = exe_dir.ok_or("could not resolve launcher executable directory")?;
     Ok(exe_dir.join(DEFAULT_HOME_DIR))
-}
-
-fn migrate_default_home_if_needed(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let source = user_home_dir()?.join(DEFAULT_HOME_DIR);
-    let source = absolute_path(source)?;
-    let destination = absolute_path(destination.to_path_buf())?;
-
-    if source == destination || !source.exists() || destination.exists() {
-        return Ok(());
-    }
-
-    if destination.starts_with(&source) {
-        return Err(format!(
-            "cannot move {} into itself at {}",
-            source.display(),
-            destination.display()
-        )
-        .into());
-    }
-
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    println!(
-        "Moving portable home from {} to {}",
-        source.display(),
-        destination.display()
-    );
-
-    move_directory(&source, &destination)?;
-    Ok(())
 }
 
 fn move_directory(source: &Path, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -2105,6 +2470,10 @@ fn print_locations(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> 
     println!("cache:       {}", runtime.cache_home.join(APP_NAME).display());
     println!("nvim:        {}", runtime.nvim.display());
 
+    if let Ok(Some(remembered)) = read_remembered_home(runtime.exe_dir.as_deref()) {
+        println!("remembered:  {}", remembered.display());
+    }
+
     if let Some(exe_dir) = &runtime.exe_dir {
         println!("launcher:    {}", exe_dir.display());
     }
@@ -2159,12 +2528,17 @@ fn print_help() {
     println!("lazyvim {}", env!("CARGO_PKG_VERSION"));
     println!();
     println!("Usage:");
-    println!("  lazyvim [--home <path>] [--portable-home] [nvim args...]");
-    println!("  lazyvim [--home <path>] [--portable-home] <command>");
+    println!("  lazyvim [--home <path>|--portable-home|--user-home] [nvim args...]");
+    println!("  lazyvim [--home <path>|--portable-home|--user-home] <command>");
     println!();
     println!("Options:");
-    println!("  --home <path>      Use a custom portable home for this run");
-    println!("  --portable-home    Store .lazyvim next to the launcher executable");
+    println!("  --home <path>       Use and remember a custom portable home");
+    println!("  --portable-home     Store and remember .lazyvim next to the launcher executable");
+    println!("  --user-home         Use and remember ~/.lazyvim");
+    println!("  --move-home         Move the remembered home to the selected home without prompting");
+    println!("  --new-home          Start a new selected home and keep the old one without prompting");
+    println!("  --delete-old-home   Delete the old remembered home and use the selected home without prompting");
+    println!("  --keep-home         Keep using the remembered home without prompting");
     println!();
     println!("Commands:");
     println!("  where      Print resolved portable directories");
@@ -2180,7 +2554,7 @@ fn print_help() {
     println!("  help       Print this help");
     println!();
     println!("Environment:");
-    println!("  LAZYVIM_HOME                Override ~/.lazyvim; use 'portable' for executable-local home");
+    println!("  LAZYVIM_HOME                Select a home; use 'portable' or 'user'");
     println!("  LAZYVIM_NVIM                Use a specific nvim executable");
     println!("  LAZYVIM_STARTER_REPOSITORY  Override the LazyVim starter repository");
 }

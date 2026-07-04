@@ -179,16 +179,12 @@ The default portable home is:
 ~/.lazyvim
 ```
 
-Use a different location for one command:
+The launcher remembers the last selected home. After you run one of these once, later `lazyvim` commands without a home flag use the remembered location:
 
 ```sh
+lazyvim --user-home .          # remember ~/.lazyvim
+lazyvim --portable-home .      # remember <launcher-directory>/.lazyvim
 lazyvim --home ~/.work-lazyvim .
-```
-
-Use an absolute path when you want to keep the portable home somewhere specific:
-
-```sh
-lazyvim --home /opt/lazyvim .
 ```
 
 Windows PowerShell:
@@ -197,44 +193,42 @@ Windows PowerShell:
 lazyvim --home D:\Tools\lazyvim-home .
 ```
 
-To keep `.lazyvim` next to the launcher executable, use portable-home mode:
-
-```sh
-lazyvim --portable-home .
-lazyvim --home portable .
-```
-
-For a persistent executable-local home, set `LAZYVIM_HOME` to `portable`:
-
-```sh
-LAZYVIM_HOME=portable lazyvim .
-```
-
 The aliases `portable`, `self`, `exe`, and `launcher` all resolve to:
 
 ```text
 <launcher-directory>/.lazyvim
 ```
 
-You can also persist any custom path with an environment variable:
+You can also select a home with `LAZYVIM_HOME`:
 
 ```sh
+LAZYVIM_HOME=portable lazyvim .
 LAZYVIM_HOME=~/.work-lazyvim lazyvim .
+LAZYVIM_HOME=user lazyvim .
 ```
 
-When you switch from the default `~/.lazyvim` home to a custom home, the launcher moves the existing default home automatically if the target directory does not exist yet:
+When you select a different home than the remembered one, the launcher asks what to do:
+
+```text
+m  move the current home to the new path
+n  start a new home at the new path and keep the old one
+d  delete the old home and start at the new path
+k  keep using the remembered home
+a  abort
+```
+
+For non-interactive scripts or CI, use an explicit action flag:
 
 ```sh
-LAZYVIM_HOME=/opt/lazyvim lazyvim .
-lazyvim --home /opt/lazyvim .
-lazyvim --portable-home .
+lazyvim --portable-home --move-home .
+lazyvim --home ~/.work-lazyvim --new-home .
+lazyvim --user-home --delete-old-home .
+lazyvim --home ~/.work-lazyvim --keep-home .
 ```
-
-This keeps existing config, plugins, Neovim, managed tools, cache, state, and Mason packages instead of starting from an empty profile. If the target home already exists, the launcher does not overwrite it.
 
 On Windows, moving between drives uses a copy-then-swap fallback so the target home is only created after the copy succeeds. If an older failed migration left a partial target directory behind, remove that partial directory first and run the command again.
 
-Print the resolved locations:
+Print the resolved locations and the remembered home:
 
 ```sh
 lazyvim where
@@ -316,7 +310,7 @@ When the portable compiler wrapper changes, the launcher clears previously compi
 
 | Variable | Description |
 |---|---|
-| `LAZYVIM_HOME` | Overrides the default `~/.lazyvim` portable home. Use `portable`, `self`, `exe`, or `launcher` to store `.lazyvim` next to the launcher executable. |
+| `LAZYVIM_HOME` | Selects the portable home. Use `portable`, `self`, `exe`, or `launcher` for executable-local storage, or `user` for `~/.lazyvim`. |
 | `LAZYVIM_NVIM` | Uses a specific Neovim executable. |
 | `LAZYVIM_STARTER_REPOSITORY` | Overrides the LazyVim starter repository used for first-run bootstrap. |
 

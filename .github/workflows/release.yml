@@ -23,6 +23,11 @@ on:
         required: true
         default: false
         type: boolean
+      skip_smoke:
+        description: "Skip release smoke tests"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -289,6 +294,7 @@ jobs:
 
   smoke:
     name: Smoke ${{ matrix.platform }}
+    if: ${{ !inputs.skip_smoke }}
     needs:
       - prepare
       - build
@@ -371,6 +377,7 @@ jobs:
 
   linux-distro-smoke:
     name: Linux distro smoke ${{ matrix.distro }}
+    if: ${{ !inputs.skip_smoke }}
     needs:
       - prepare
       - build
@@ -432,6 +439,14 @@ jobs:
 
   release:
     name: Create GitHub Release
+    if: >-
+      ${{
+        always() &&
+        needs.prepare.result == 'success' &&
+        needs.build.result == 'success' &&
+        (inputs.skip_smoke ||
+          (needs.smoke.result == 'success' && needs.linux-distro-smoke.result == 'success'))
+      }}
     needs:
       - prepare
       - build

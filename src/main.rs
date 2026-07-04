@@ -13,7 +13,10 @@ const ZIG_VERSION: &str = "0.14.0";
 const TREE_SITTER_VERSION: &str = "0.26.10";
 const RIPGREP_VERSION: &str = "15.1.0";
 const FD_VERSION: &str = "10.4.2";
+const FD_MACOS_X86_64_VERSION: &str = "10.3.0";
 const LAZYGIT_VERSION: &str = "0.62.2";
+const PORTABLE_TOOLCHAIN_STAMP: &str = "2026-07-04-portable-cc-v4";
+const EMBEDDED_TREE_SITTER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/embedded-tree-sitter"));
 
 #[derive(Debug)]
 struct Cli {
@@ -53,6 +56,16 @@ struct Runtime {
 }
 
 fn main() {
+    if is_compiler_wrapper_invocation() {
+        match run_compiler_wrapper() {
+            Ok(code) => exit(code),
+            Err(error) => {
+                eprintln!("lazyvim compiler wrapper: {error}");
+                exit(1);
+            }
+        }
+    }
+
     if let Err(error) = run() {
         eprintln!("lazyvim: {error}");
         exit(1);
@@ -85,7 +98,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         command => {
-            let bootstrap = !matches!(command, CliCommand::Doctor | CliCommand::Where);
+            let bootstrap = matches!(
+                command,
+                CliCommand::Launch(_) | CliCommand::Sync | CliCommand::Restore | CliCommand::Update | CliCommand::Clean
+            );
             let runtime = prepare_runtime(cli.home, cli.portable_home, bootstrap, true)?;
             match command {
                 CliCommand::Launch(args) => launch_nvim(&runtime, &args),
@@ -210,7 +226,9 @@ fn prepare_runtime(
         }
 
         ensure_managed_tools(&home, &path_value)?;
+        ensure_treesitter_cache_for_current_toolchain(&data_home, &state_home)?;
         ensure_starter_config(&config_dir)?;
+        ensure_portable_lazyvim_config(&config_dir)?;
     }
 
     Ok(Runtime {
@@ -475,7 +493,7 @@ fn install_system_dependencies(missing: &[String]) -> Result<(), Box<dyn std::er
     }
 
     if cfg!(target_os = "linux") {
-        return install_linux_system_dependencies();
+        return install_linux_system_dependencies(missing);
     }
 
     Err(format!("automatic dependency installation is not supported on this platform; missing: {}", missing.join(", ")).into())
@@ -554,26 +572,84 @@ enum LinuxDistro {
     Unknown,
 }
 
-fn install_linux_system_dependencies() -> Result<(), Box<dyn std::error::Error>> {
+fn install_linux_system_dependencies(missing: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let distro = detect_linux_distro();
+    if distro == LinuxDistro::Unknown {
+        return Err("could not detect a supported Linux distribution for dependency installation".into());
+    }
+
+    let packages = linux_system_packages(distro, missing);
+    if packages.is_empty() {
+        return Ok(());
+    }
+
+    let package_list = packages.join(" ");
     let command = match distro {
-        LinuxDistro::Alpine => "apk add --no-cache git curl ca-certificates tar unzip xz tree-sitter-cli",
-        LinuxDistro::Debian => "apt-get update && apt-get install -y git curl ca-certificates tar unzip xz-utils",
-        LinuxDistro::Arch => "pacman -Sy --noconfirm --needed git curl ca-certificates tar unzip xz tree-sitter-cli",
-        LinuxDistro::Fedora => "dnf install -y git curl ca-certificates tar unzip xz tree-sitter-cli",
-        LinuxDistro::AmazonLinux | LinuxDistro::Rhel => {
+        LinuxDistro::Alpine => format!("apk add --no-cache {package_list}"),
+        LinuxDistro::Debian => format!("apt-get update && apt-get install -y {package_list}"),
+        LinuxDistro::Arch => format!("pacman -Sy --noconfirm --needed {package_list}"),
+        LinuxDistro::Fedora | LinuxDistro::AmazonLinux | LinuxDistro::Rhel => {
             if command_available_without_path("dnf") {
-                "dnf install -y git curl ca-certificates tar unzip xz tree-sitter-cli"
+                format!("dnf install -y {package_list}")
             } else {
-                "yum install -y git curl ca-certificates tar unzip xz"
+                let yum_packages = linux_system_packages_for_yum(distro, missing).join(" ");
+                format!("yum install -y {yum_packages}")
             }
         }
-        LinuxDistro::Unknown => {
-            return Err("could not detect a supported Linux distribution for dependency installation".into());
-        }
+        LinuxDistro::Unknown => unreachable!("unknown distro is handled above"),
     };
 
-    run_privileged_shell(command)
+    run_privileged_shell(&command)
+}
+
+fn linux_system_packages(distro: LinuxDistro, missing: &[String]) -> Vec<&'static str> {
+    let mut packages = Vec::new();
+
+    push_unique(&mut packages, "ca-certificates");
+    push_unique(&mut packages, "gzip");
+    push_unique(
+        &mut packages,
+        match distro {
+            LinuxDistro::Debian => "xz-utils",
+            _ => "xz",
+        },
+    );
+
+    for command in missing {
+        match command.as_str() {
+            "git" => push_unique(&mut packages, "git"),
+            "curl" => push_unique(
+                &mut packages,
+                match distro {
+                    LinuxDistro::AmazonLinux | LinuxDistro::Rhel => "curl-minimal",
+                    _ => "curl",
+                },
+            ),
+            "tar" => push_unique(&mut packages, "tar"),
+            "unzip" => push_unique(&mut packages, "unzip"),
+            _ => {}
+        }
+    }
+
+    packages
+}
+
+fn linux_system_packages_for_yum(distro: LinuxDistro, missing: &[String]) -> Vec<&'static str> {
+    let mut packages = linux_system_packages(distro, missing);
+
+    for package in &mut packages {
+        if *package == "curl-minimal" {
+            *package = "curl";
+        }
+    }
+
+    packages
+}
+
+fn push_unique(packages: &mut Vec<&'static str>, package: &'static str) {
+    if !packages.contains(&package) {
+        packages.push(package);
+    }
 }
 
 fn install_tree_sitter_from_system_package(path_value: &OsString) -> Result<(), Box<dyn std::error::Error>> {
@@ -585,14 +661,10 @@ fn install_tree_sitter_from_system_package(path_value: &OsString) -> Result<(), 
         LinuxDistro::Alpine => run_privileged_shell("apk add --no-cache tree-sitter-cli"),
         LinuxDistro::Arch => run_privileged_shell("pacman -Sy --noconfirm --needed tree-sitter-cli"),
         LinuxDistro::Fedora => run_privileged_shell("dnf install -y tree-sitter-cli"),
-        LinuxDistro::Rhel | LinuxDistro::AmazonLinux => {
-            if command_available_without_path("dnf") {
-                run_privileged_shell("dnf install -y tree-sitter-cli")
-            } else {
-                Err("tree-sitter-cli package is not available through yum on this platform".into())
-            }
+        LinuxDistro::Debian => run_privileged_shell("apt-get update && apt-get install -y tree-sitter-cli"),
+        LinuxDistro::Rhel | LinuxDistro::AmazonLinux | LinuxDistro::Unknown => {
+            Err("tree-sitter-cli system package is not available for this distro".into())
         }
-        LinuxDistro::Debian | LinuxDistro::Unknown => Err("tree-sitter-cli system package is not available for this distro".into()),
     }
 }
 
@@ -769,8 +841,8 @@ fn build_path(home: &Path, exe_dir: Option<&Path>) -> io::Result<OsString> {
     let mut paths = Vec::new();
 
     paths.push(home.join("nvim").join("bin"));
-    paths.push(home.join("tools").join("zig"));
     paths.push(home.join("bin"));
+    paths.push(home.join("tools").join("zig"));
 
     if cfg!(windows) {
         paths.push(PathBuf::from(r"C:\Program Files\Git\cmd"));
@@ -785,8 +857,8 @@ fn build_path(home: &Path, exe_dir: Option<&Path>) -> io::Result<OsString> {
 
     if let Some(exe_dir) = exe_dir {
         paths.push(exe_dir.join("nvim").join("bin"));
-        paths.push(exe_dir.join("tools").join("zig"));
         paths.push(exe_dir.join("bin"));
+        paths.push(exe_dir.join("tools").join("zig"));
     }
 
     if let Some(existing) = env::var_os("PATH") {
@@ -799,7 +871,17 @@ fn build_path(home: &Path, exe_dir: Option<&Path>) -> io::Result<OsString> {
 
 fn install_deps_command(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
     ensure_system_dependencies(&runtime.path_value)?;
+
+    let nvim = resolve_nvim(&runtime.home, runtime.exe_dir.as_deref());
+    if !command_runs(&nvim, &["--version"], Some(&runtime.path_value)) {
+        install_neovim(&runtime.home)?;
+    }
+
     ensure_managed_tools(&runtime.home, &runtime.path_value)?;
+    ensure_treesitter_cache_for_current_toolchain(&runtime.data_home, &runtime.state_home)?;
+    ensure_starter_config(&runtime.config_dir)?;
+    ensure_portable_lazyvim_config(&runtime.config_dir)?;
+
     println!("Installed LazyVim dependencies into {}", runtime.home.display());
     Ok(())
 }
@@ -870,24 +952,97 @@ fn managed_tool_path(home: &Path, executable_name: &str) -> PathBuf {
 fn install_c_compiler_wrappers(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let bin_dir = home.join("bin");
     fs::create_dir_all(&bin_dir)?;
-    let zig = zig_executable_path(home);
 
-    if cfg!(windows) {
-        for name in ["cc.cmd", "gcc.cmd", "clang.cmd", "cc.bat", "gcc.bat", "clang.bat"] {
-            let wrapper = bin_dir.join(name);
-            let content = format!("@echo off\r\n\"{}\" cc %*\r\n", zig.display());
-            fs::write(wrapper, content)?;
-        }
+    let launcher = env::current_exe()?;
+    let wrapper_names: &[&str] = if cfg!(windows) {
+        &["cc.exe", "gcc.exe", "clang.exe", "c++.exe", "g++.exe", "clang++.exe"]
     } else {
-        for name in ["cc", "gcc", "clang"] {
-            let wrapper = bin_dir.join(name);
-            let content = format!("#!/bin/sh\nexec \"{}\" cc \"$@\"\n", zig.display());
-            fs::write(&wrapper, content)?;
-            make_executable(&wrapper)?;
-        }
+        &["cc", "gcc", "clang", "c++", "g++", "clang++"]
+    };
+
+    for name in wrapper_names {
+        install_launcher_wrapper(&launcher, &bin_dir.join(name))?;
     }
 
     Ok(())
+}
+
+fn install_launcher_wrapper(source: &Path, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if destination.exists() {
+        fs::remove_file(destination)?;
+    }
+
+    if fs::hard_link(source, destination).is_err() {
+        fs::copy(source, destination)?;
+    }
+
+    make_executable(destination)?;
+    Ok(())
+}
+
+fn is_compiler_wrapper_invocation() -> bool {
+    let Ok(exe) = env::current_exe() else {
+        return false;
+    };
+
+    let Some(stem) = exe.file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+
+    matches!(stem, "cc" | "gcc" | "clang" | "c++" | "g++" | "clang++")
+}
+
+fn run_compiler_wrapper() -> Result<i32, Box<dyn std::error::Error>> {
+    let exe = env::current_exe()?;
+    let bin_dir = exe.parent().ok_or("compiler wrapper has no parent directory")?;
+    let home = bin_dir.parent().ok_or("compiler wrapper is not inside a LazyVim home bin directory")?;
+    let zig = zig_executable_path(home);
+
+    if !zig.exists() {
+        return Err(format!("Zig compiler was not found at {}", zig.display()).into());
+    }
+
+    let mode = compiler_wrapper_mode(&exe);
+    let mut command = Command::new(zig);
+    command.arg(mode);
+    command.args(sanitize_compiler_args(env::args_os().skip(1)));
+    command.env("PATH", build_path(home, None)?);
+    clear_cargo_target_env(&mut command);
+
+    let status = command.status()?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn sanitize_compiler_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut sanitized = Vec::new();
+    let mut skip_next = false;
+
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
+        let arg_text = arg.to_string_lossy();
+        if arg_text == "-target" || arg_text == "--target" {
+            skip_next = true;
+            continue;
+        }
+        if arg_text.starts_with("--target=") {
+            continue;
+        }
+
+        sanitized.push(arg);
+    }
+
+    sanitized
+}
+
+fn compiler_wrapper_mode(exe: &Path) -> &'static str {
+    match exe.file_stem().and_then(|value| value.to_str()) {
+        Some("c++" | "g++" | "clang++") => "c++",
+        _ => "cc",
+    }
 }
 
 fn zig_executable_path(home: &Path) -> PathBuf {
@@ -896,6 +1051,70 @@ fn zig_executable_path(home: &Path) -> PathBuf {
 
 fn tree_sitter_executable_path(home: &Path) -> PathBuf {
     home.join("bin").join(if cfg!(windows) { "tree-sitter.exe" } else { "tree-sitter" })
+}
+
+
+fn compiler_wrapper_path(home: &Path) -> PathBuf {
+    home.join("bin").join(if cfg!(windows) { "cc.exe" } else { "cc" })
+}
+
+fn cxx_compiler_wrapper_path(home: &Path) -> PathBuf {
+    home.join("bin").join(if cfg!(windows) { "c++.exe" } else { "c++" })
+}
+
+fn ensure_treesitter_cache_for_current_toolchain(
+    data_home: &Path,
+    state_home: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state_dir = state_home.join(APP_NAME);
+    let stamp_path = state_dir.join("portable-toolchain-stamp");
+
+    if matches!(fs::read_to_string(&stamp_path), Ok(value) if value == PORTABLE_TOOLCHAIN_STAMP) {
+        return Ok(());
+    }
+
+    let data_dir = data_home.join(APP_NAME);
+    for path in [
+        data_dir.join("site").join("parser"),
+        data_dir.join("lazy").join("nvim-treesitter").join("parser"),
+        data_dir.join("lazy").join("nvim-treesitter").join("parser-info"),
+    ] {
+        if path.exists() {
+            fs::remove_dir_all(&path)?;
+        }
+    }
+
+    fs::create_dir_all(&state_dir)?;
+    fs::write(stamp_path, PORTABLE_TOOLCHAIN_STAMP)?;
+    Ok(())
+}
+
+fn ensure_portable_lazyvim_config(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let plugins_dir = config_dir.join("lua").join("plugins");
+    fs::create_dir_all(&plugins_dir)?;
+
+    let portable_plugin = plugins_dir.join("portable.lua");
+    let contents = r#"-- Generated by the portable LazyVim launcher.
+-- This keeps Treesitter parser builds inside the managed toolchain.
+return {
+  {
+    "nvim-treesitter/nvim-treesitter",
+    init = function()
+      local ok, install = pcall(require, "nvim-treesitter.install")
+      if ok then
+        install.compilers = { vim.env.CC or "cc", "zig", "clang", "gcc", "cc" }
+      end
+    end,
+    opts = function(_, opts)
+      opts.install = opts.install or {}
+      opts.install.compilers = { vim.env.CC or "cc", "zig", "clang", "gcc", "cc" }
+    end,
+  },
+}
+"#;
+
+    fs::write(portable_plugin, contents)?;
+    Ok(())
 }
 
 
@@ -922,23 +1141,26 @@ fn ripgrep_release_asset() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn install_fd(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let asset = fd_release_asset()?;
-    let url = format!("https://github.com/sharkdp/fd/releases/download/v{FD_VERSION}/{asset}");
+    let (version, asset) = fd_release_asset()?;
+    let url = format!("https://github.com/sharkdp/fd/releases/download/v{version}/{asset}");
     install_single_binary_from_archive(home, "fd", &url, &asset, if cfg!(windows) { "fd.exe" } else { "fd" })
 }
 
-fn fd_release_asset() -> Result<String, Box<dyn std::error::Error>> {
+fn fd_release_asset() -> Result<(&'static str, String), Box<dyn std::error::Error>> {
     if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
-        return Ok(format!("fd-v{FD_VERSION}-x86_64-pc-windows-msvc.zip"));
+        return Ok((FD_VERSION, format!("fd-v{FD_VERSION}-x86_64-pc-windows-msvc.zip")));
     }
     if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        return Ok(format!("fd-v{FD_VERSION}-x86_64-unknown-linux-musl.tar.gz"));
+        return Ok((FD_VERSION, format!("fd-v{FD_VERSION}-x86_64-unknown-linux-musl.tar.gz")));
     }
     if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
-        return Ok(format!("fd-v{FD_VERSION}-x86_64-apple-darwin.tar.gz"));
+        return Ok((
+            FD_MACOS_X86_64_VERSION,
+            format!("fd-v{FD_MACOS_X86_64_VERSION}-x86_64-apple-darwin.tar.gz"),
+        ));
     }
     if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        return Ok(format!("fd-v{FD_VERSION}-aarch64-apple-darwin.tar.gz"));
+        return Ok((FD_VERSION, format!("fd-v{FD_VERSION}-aarch64-apple-darwin.tar.gz")));
     }
     Err("automatic fd installation is not supported on this platform".into())
 }
@@ -1086,47 +1308,133 @@ fn zig_release_asset() -> Result<String, Box<dyn std::error::Error>> {
     Err("automatic Zig installation is not supported on this platform".into())
 }
 
+fn install_embedded_tree_sitter(home: &Path, path_value: &OsString) -> Result<bool, Box<dyn std::error::Error>> {
+    if EMBEDDED_TREE_SITTER.is_empty() {
+        return Ok(false);
+    }
+
+    let destination = tree_sitter_executable_path(home);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::write(&destination, EMBEDDED_TREE_SITTER)?;
+    make_executable(&destination)?;
+
+    if command_runs(&destination, &["--version"], Some(path_value)) {
+        return Ok(true);
+    }
+
+    let _ = fs::remove_file(&destination);
+    Ok(false)
+}
+
+fn install_system_tree_sitter_wrapper(home: &Path, path_value: &OsString) -> Result<bool, Box<dyn std::error::Error>> {
+    if !cfg!(target_os = "linux") {
+        return Ok(false);
+    }
+
+    if install_tree_sitter_from_system_package(path_value).is_err() {
+        return Ok(false);
+    }
+
+    let Some(system_tree_sitter) = resolve_system_command("tree-sitter", path_value) else {
+        return Ok(false);
+    };
+
+    let destination = tree_sitter_executable_path(home);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::copy(&system_tree_sitter, &destination)?;
+    make_executable(&destination)?;
+
+    Ok(command_runs(&destination, &["--version"], Some(path_value)))
+}
+
+fn resolve_system_command(command_name: &str, path_value: &OsString) -> Option<PathBuf> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {command_name}"))
+        .env("PATH", path_value)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
 fn install_tree_sitter(home: &Path, path_value: &OsString) -> Result<(), Box<dyn std::error::Error>> {
-    let asset = tree_sitter_release_asset()?;
-    let url = format!("https://github.com/tree-sitter/tree-sitter/releases/download/v{TREE_SITTER_VERSION}/{asset}");
-    let downloads_dir = home.join("downloads");
-    let archive_path = downloads_dir.join(asset);
-    let temp_dir = home.join(".tree-sitter-install");
     let destination = tree_sitter_executable_path(home);
 
-    fs::create_dir_all(&downloads_dir)?;
-
-    if cfg!(target_os = "linux")
-        && install_tree_sitter_from_system_package(path_value).is_ok()
-        && (command_runs(&destination, &["--version"], Some(path_value))
-            || command_runs(Path::new("tree-sitter"), &["--version"], Some(path_value)))
-    {
+    if install_embedded_tree_sitter(home, path_value)? {
         return Ok(());
     }
 
-    println!("tree-sitter CLI was not found. Downloading tree-sitter {TREE_SITTER_VERSION} from {url}");
-    download_file(&url, &archive_path)?;
-    extract_tree_sitter_archive(&archive_path, &temp_dir, &destination)?;
-    make_executable(&destination)?;
+    if install_system_tree_sitter_wrapper(home, path_value)? {
+        return Ok(());
+    }
 
-    Ok(())
+    let downloads_dir = home.join("downloads");
+    let temp_dir = home.join(".tree-sitter-install");
+    fs::create_dir_all(&downloads_dir)?;
+
+    let mut errors = Vec::new();
+    for (version, asset) in tree_sitter_release_assets()? {
+        let url = format!("https://github.com/tree-sitter/tree-sitter/releases/download/v{version}/{asset}");
+        let archive_path = downloads_dir.join(&asset);
+
+        println!("tree-sitter CLI was not found. Downloading tree-sitter {version} from {url}");
+        match download_file(&url, &archive_path)
+            .and_then(|_| extract_tree_sitter_archive(&archive_path, &temp_dir, &destination))
+            .and_then(|_| make_executable(&destination).map_err(Into::into))
+        {
+            Ok(()) if command_runs(&destination, &["--version"], Some(path_value)) => return Ok(()),
+            Ok(()) => {
+                let _ = fs::remove_file(&destination);
+                errors.push(format!("{asset} was installed but could not be executed"));
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&destination);
+                errors.push(format!("{asset}: {error}"));
+            }
+        }
+    }
+
+    Err(format!("failed to install a working tree-sitter CLI: {}", errors.join("; ")).into())
 }
 
-fn tree_sitter_release_asset() -> Result<&'static str, Box<dyn std::error::Error>> {
+fn tree_sitter_release_assets() -> Result<Vec<(&'static str, String)>, Box<dyn std::error::Error>> {
     if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
-        return Ok("tree-sitter-cli-windows-x64.zip");
+        return Ok(vec![(TREE_SITTER_VERSION, "tree-sitter-cli-windows-x64.zip".to_string())]);
     }
 
     if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        return Ok("tree-sitter-cli-linux-x64.zip");
+        return Ok(vec![
+            (TREE_SITTER_VERSION, "tree-sitter-cli-linux-x64.zip".to_string()),
+            ("0.26.7", "tree-sitter-linux-x64.gz".to_string()),
+            ("0.25.10", "tree-sitter-linux-x64.gz".to_string()),
+            ("0.24.7", "tree-sitter-linux-x64.gz".to_string()),
+        ]);
     }
 
     if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
-        return Ok("tree-sitter-cli-macos-x64.zip");
+        return Ok(vec![(TREE_SITTER_VERSION, "tree-sitter-cli-macos-x64.zip".to_string())]);
     }
 
     if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        return Ok("tree-sitter-cli-macos-arm64.zip");
+        return Ok(vec![(TREE_SITTER_VERSION, "tree-sitter-cli-macos-arm64.zip".to_string())]);
     }
 
     Err("automatic tree-sitter CLI installation is not supported on this platform".into())
@@ -1180,7 +1488,9 @@ fn extract_tree_sitter_archive(
     }
     fs::create_dir_all(temp_dir)?;
 
-    if cfg!(windows) {
+    if archive_path.extension().and_then(|value| value.to_str()) == Some("gz") {
+        extract_gzip_executable(archive_path, destination)?;
+    } else if cfg!(windows) {
         extract_tree_sitter_with_powershell(archive_path, temp_dir, destination)?;
     } else {
         let extracted = extract_zip_with_available_tool(archive_path, temp_dir)?;
@@ -1195,6 +1505,27 @@ fn extract_tree_sitter_archive(
         fs::remove_dir_all(temp_dir)?;
     }
 
+    Ok(())
+}
+
+fn extract_gzip_executable(archive_path: &Path, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let output = Command::new("gzip")
+        .arg("-dc")
+        .arg(archive_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("failed to extract {} with gzip: {}", archive_path.display(), stderr.trim()).into());
+    }
+
+    fs::write(destination, output.stdout)?;
     Ok(())
 }
 
@@ -1314,7 +1645,24 @@ fn make_executable(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn install_neovim_from_system_package(path_value: &OsString) -> Result<bool, Box<dyn std::error::Error>> {
+    if !cfg!(target_os = "linux") || detect_linux_distro() != LinuxDistro::Alpine {
+        return Ok(false);
+    }
+
+    if !command_available("nvim", path_value) {
+        run_privileged_shell("apk add --no-cache neovim")?;
+    }
+
+    Ok(command_runs(Path::new("nvim"), &["--version"], Some(path_value)))
+}
+
 fn install_neovim(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let path_value = build_path(home, None)?;
+    if install_neovim_from_system_package(&path_value)? {
+        return Ok(());
+    }
+
     let asset = neovim_release_asset()?;
     let url = format!("https://github.com/neovim/neovim/releases/latest/download/{asset}");
     let downloads_dir = home.join("downloads");
@@ -1521,6 +1869,28 @@ fn clear_macos_quarantine(install_dir: &Path) {
         .status();
 }
 
+fn clear_cargo_target_env(command: &mut Command) {
+    // tree-sitter's parser builder can pass Rust target triples such as
+    // x86_64-unknown-linux-musl or x86_64-pc-windows-msvc to CC. Zig uses its
+    // own target query format, so the portable compiler wrapper strips target
+    // flags and this removes the environment variables that commonly introduce
+    // those Rust triples in CI and cross-compiled binaries.
+    for name in [
+        "TARGET",
+        "HOST",
+        "BUILD_TARGET",
+        "BUILD_HOST",
+        "CARGO_BUILD_TARGET",
+        "CARGO_CFG_TARGET_ARCH",
+        "CARGO_CFG_TARGET_ENV",
+        "CARGO_CFG_TARGET_FAMILY",
+        "CARGO_CFG_TARGET_OS",
+        "CARGO_CFG_TARGET_VENDOR",
+    ] {
+        command.env_remove(name);
+    }
+}
+
 fn command_runs(command_path: &Path, args: &[&str], path_value: Option<&OsString>) -> bool {
     let mut command = Command::new(command_path);
     command.args(args).stdout(Stdio::null()).stderr(Stdio::null());
@@ -1542,8 +1912,15 @@ fn base_command(runtime: &Runtime) -> Command {
         .env("XDG_DATA_HOME", &runtime.data_home)
         .env("XDG_STATE_HOME", &runtime.state_home)
         .env("XDG_CACHE_HOME", &runtime.cache_home)
-        .env("PATH", &runtime.path_value);
+        .env("PATH", &runtime.path_value)
+        .env("CC", compiler_wrapper_path(&runtime.home))
+        .env("CXX", cxx_compiler_wrapper_path(&runtime.home))
+        .env("CFLAGS", "-O2")
+        .env("CXXFLAGS", "-O2")
+        .env("CC_KNOWN_WRAPPER_CUSTOM", "cc")
+        .env("TREE_SITTER_CLI", tree_sitter_executable_path(&runtime.home));
 
+    clear_cargo_target_env(&mut command);
     command
 }
 
@@ -1557,13 +1934,29 @@ fn launch_nvim(runtime: &Runtime, args: &[String]) -> Result<(), Box<dyn std::er
 
 fn run_lazy_command(runtime: &Runtime, command_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let lazy_command = format!("+Lazy! {command_name}");
-    let status = base_command(runtime)
+    let output = base_command(runtime)
         .arg("--headless")
         .arg(lazy_command)
         .arg("+qa")
-        .status()?;
+        .output()?;
 
-    exit(status.code().unwrap_or(1));
+    print_process_output(&output.stdout, &output.stderr);
+
+    if lazy_output_has_errors(&output.stdout) || lazy_output_has_errors(&output.stderr) {
+        return Err(format!("Lazy {command_name} reported plugin install errors").into());
+    }
+
+    exit(output.status.code().unwrap_or(1));
+}
+
+fn print_process_output(stdout: &[u8], stderr: &[u8]) {
+    print!("{}", String::from_utf8_lossy(stdout));
+    eprint!("{}", String::from_utf8_lossy(stderr));
+}
+
+fn lazy_output_has_errors(output: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(output).to_lowercase();
+    text.contains("nvim-treesitter/install/") && (text.contains(" error:") || text.contains("error during") || text.contains("failed to compile parser"))
 }
 
 fn doctor(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
@@ -1572,15 +1965,27 @@ fn doctor(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
     print_locations(runtime)?;
     println!();
 
-    check_command("nvim", &runtime.nvim, &["--version"], true, Some(&runtime.path_value))?;
-    check_command("zig", Path::new("zig"), &["version"], true, Some(&runtime.path_value))?;
-    check_command("cc", Path::new("cc"), &["--version"], true, Some(&runtime.path_value))?;
-    check_command("tree-sitter", Path::new("tree-sitter"), &["--version"], true, Some(&runtime.path_value))?;
-    check_command("git", Path::new("git"), &["--version"], true, Some(&runtime.path_value))?;
-    check_command("curl", Path::new("curl"), &["--version"], true, Some(&runtime.path_value))?;
-    check_command("rg", Path::new("rg"), &["--version"], true, Some(&runtime.path_value))?;
-    check_command("fd", Path::new("fd"), &["--version"], true, Some(&runtime.path_value))?;
-    check_command("lazygit", Path::new("lazygit"), &["--version"], true, Some(&runtime.path_value))?;
+    let mut failures = 0;
+
+    for check in [
+        check_command("nvim", &runtime.nvim, &["--version"], true, Some(&runtime.path_value))?,
+        check_command("zig", Path::new("zig"), &["version"], true, Some(&runtime.path_value))?,
+        check_command("cc", &compiler_wrapper_path(&runtime.home), &["--version"], true, Some(&runtime.path_value))?,
+        check_command("tree-sitter", Path::new("tree-sitter"), &["--version"], true, Some(&runtime.path_value))?,
+        check_command("git", Path::new("git"), &["--version"], true, Some(&runtime.path_value))?,
+        check_command("curl", Path::new("curl"), &["--version"], true, Some(&runtime.path_value))?,
+        check_command("rg", Path::new("rg"), &["--version"], true, Some(&runtime.path_value))?,
+        check_command("fd", Path::new("fd"), &["--version"], true, Some(&runtime.path_value))?,
+        check_command("lazygit", Path::new("lazygit"), &["--version"], true, Some(&runtime.path_value))?,
+    ] {
+        if !check {
+            failures += 1;
+        }
+    }
+
+    if failures > 0 {
+        return Err(format!("doctor found {failures} failing required check(s)").into());
+    }
 
     Ok(())
 }
@@ -1600,7 +2005,13 @@ fn print_locations(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-fn check_command(label: &str, command_path: &Path, args: &[&str], required: bool, path_value: Option<&OsString>) -> Result<(), Box<dyn std::error::Error>> {
+fn check_command(
+    label: &str,
+    command_path: &Path,
+    args: &[&str],
+    required: bool,
+    path_value: Option<&OsString>,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let mut command = Command::new(command_path);
     command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -1621,19 +2032,20 @@ fn check_command(label: &str, command_path: &Path, args: &[&str], required: bool
                 .unwrap_or("ok");
 
             println!("[ok]   {label}: {first_line}");
+            Ok(true)
         }
         Ok(output) => {
             let message = String::from_utf8_lossy(&output.stderr);
             let level = if required { "fail" } else { "warn" };
             println!("[{level}] {label}: exited with {} {}", output.status, message.trim());
+            Ok(!required)
         }
         Err(error) => {
             let level = if required { "fail" } else { "warn" };
             println!("[{level}] {label}: {error}");
+            Ok(!required)
         }
     }
-
-    Ok(())
 }
 
 fn print_help() {
@@ -1664,4 +2076,75 @@ fn print_help() {
     println!("  LAZYVIM_HOME                Override ~/.lazyvim; use 'portable' for executable-local home");
     println!("  LAZYVIM_NVIM                Use a specific nvim executable");
     println!("  LAZYVIM_STARTER_REPOSITORY  Override the LazyVim starter repository");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn os_args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(|arg| OsString::from(*arg)).collect()
+    }
+
+    fn string_args(args: Vec<OsString>) -> Vec<String> {
+        args.into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn sanitize_compiler_args_removes_joined_target_flag() {
+        let args = sanitize_compiler_args(os_args(&[
+            "-O2",
+            "--target=x86_64-unknown-linux-musl",
+            "parser.c",
+        ]));
+
+        assert_eq!(string_args(args), vec![String::from("-O2"), String::from("parser.c")]);
+    }
+
+    #[test]
+    fn sanitize_compiler_args_removes_split_target_flag() {
+        let args = sanitize_compiler_args(os_args(&[
+            "-O2",
+            "-target",
+            "x86_64-pc-windows-msvc",
+            "parser.c",
+        ]));
+
+        assert_eq!(string_args(args), vec![String::from("-O2"), String::from("parser.c")]);
+    }
+
+    #[test]
+    fn sanitize_compiler_args_removes_split_double_dash_target_flag() {
+        let args = sanitize_compiler_args(os_args(&[
+            "-O2",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "parser.c",
+        ]));
+
+        assert_eq!(string_args(args), vec![String::from("-O2"), String::from("parser.c")]);
+    }
+
+    #[test]
+    fn linux_system_packages_does_not_install_curl_when_curl_is_not_missing_on_rhel() {
+        let missing = vec![String::from("git"), String::from("unzip")];
+        let packages = linux_system_packages(LinuxDistro::Rhel, &missing);
+
+        assert!(packages.contains(&"git"));
+        assert!(packages.contains(&"unzip"));
+        assert!(!packages.contains(&"curl"));
+        assert!(!packages.contains(&"curl-minimal"));
+    }
+
+    #[test]
+    fn linux_system_packages_uses_curl_minimal_on_amazon_linux_when_curl_is_missing() {
+        let missing = vec![String::from("curl")];
+        let packages = linux_system_packages(LinuxDistro::AmazonLinux, &missing);
+
+        assert!(packages.contains(&"curl-minimal"));
+        assert!(!packages.contains(&"curl"));
+    }
+
 }

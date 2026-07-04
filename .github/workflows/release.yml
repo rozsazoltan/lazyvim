@@ -216,7 +216,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      - name: Build embedded tree-sitter CLI
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install tree-sitter-cli --version 0.26.10 --locked --target x86_64-unknown-linux-musl --root "${RUNNER_TEMP}/tree-sitter-cli"
+
       - name: Build
+        env:
+          LAZYVIM_EMBED_TREE_SITTER: ${{ runner.temp }}/tree-sitter-cli/bin/tree-sitter
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Prepare executable asset
@@ -252,11 +261,156 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  smoke:
+    name: Smoke ${{ matrix.platform }}
+    needs:
+      - prepare
+      - build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-22.04
+            asset: lazyvim-linux-x86_64
+          - platform: windows-x86_64
+            os: windows-latest
+            asset: lazyvim-windows-x86_64.exe
+          - platform: macos-x86_64
+            os: macos-15-intel
+            asset: lazyvim-macos-x86_64
+          - platform: macos-arm64
+            os: macos-latest
+            asset: lazyvim-macos-arm64
+    steps:
+      - name: Download executable artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: smoke-bin
+
+      - name: Smoke test executable on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe="smoke-bin/${{ matrix.asset }}"
+          home="${RUNNER_TEMP}/lazyvim-home"
+          rm -rf "$home"
+          chmod +x "$exe"
+
+          "$exe" --version
+          "$exe" --home "$home" install-deps
+          "$exe" --home "$home" doctor 2>&1 | tee doctor.log
+          if grep -F "[fail]" doctor.log; then
+            exit 1
+          fi
+          "$exe" --home "$home" sync 2>&1 | tee sync.log
+          if grep -E "nvim-treesitter/install/.*error|Failed to compile parser|UnknownOperatingSystem" sync.log; then
+            exit 1
+          fi
+          "$exe" --home "$home" doctor 2>&1 | tee doctor-after-sync.log
+          if grep -F "[fail]" doctor-after-sync.log; then
+            exit 1
+          fi
+
+      - name: Smoke test executable on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Resolve-Path "smoke-bin/${{ matrix.asset }}"
+          $lazyvimHome = Join-Path $env:RUNNER_TEMP "lazyvim-home"
+          Remove-Item -Recurse -Force $lazyvimHome -ErrorAction SilentlyContinue
+
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $exe --home $lazyvimHome install-deps
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $exe --home $lazyvimHome doctor 2>&1 | Tee-Object -FilePath doctor.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Select-String -Path doctor.log -SimpleMatch "[fail]") { exit 1 }
+
+          & $exe --home $lazyvimHome sync 2>&1 | Tee-Object -FilePath sync.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Select-String -Path sync.log -Pattern "nvim-treesitter/install/.*error|Failed to compile parser|UnknownOperatingSystem") { exit 1 }
+
+          & $exe --home $lazyvimHome doctor 2>&1 | Tee-Object -FilePath doctor-after-sync.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Select-String -Path doctor-after-sync.log -SimpleMatch "[fail]") { exit 1 }
+
+  linux-distro-smoke:
+    name: Linux distro smoke ${{ matrix.distro }}
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: alpine
+            image: alpine:edge
+          - distro: debian
+            image: debian:12-slim
+          - distro: arch
+            image: archlinux:latest
+          - distro: fedora
+            image: fedora:latest
+          - distro: amazonlinux
+            image: amazonlinux:2023
+          - distro: rhel
+            image: rockylinux:9
+    steps:
+      - name: Download Linux executable artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lazyvim-linux-x86_64
+          path: smoke-bin
+
+      - name: Smoke test Linux executable in ${{ matrix.distro }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x smoke-bin/lazyvim-linux-x86_64
+          docker run --rm \
+            -v "${PWD}/smoke-bin:/work:ro" \
+            "${{ matrix.image }}" \
+            sh -lc '
+              set -eu
+              cp /work/lazyvim-linux-x86_64 /tmp/lazyvim
+              chmod +x /tmp/lazyvim
+              home=/tmp/lazyvim-home
+              rm -rf "$home"
+
+              /tmp/lazyvim --version
+              /tmp/lazyvim --home "$home" install-deps
+              /tmp/lazyvim --home "$home" doctor 2>&1 | tee /tmp/doctor.log
+              if grep -F "[fail]" /tmp/doctor.log; then
+                exit 1
+              fi
+              /tmp/lazyvim --home "$home" sync 2>&1 | tee /tmp/sync.log
+              if grep -E "nvim-treesitter/install/.*error|Failed to compile parser|UnknownOperatingSystem" /tmp/sync.log; then
+                exit 1
+              fi
+              /tmp/lazyvim --home "$home" doctor 2>&1 | tee /tmp/doctor-after-sync.log
+              if grep -F "[fail]" /tmp/doctor-after-sync.log; then
+                exit 1
+              fi
+            '
+
   release:
     name: Create GitHub Release
     needs:
       - prepare
       - build
+      - smoke
+      - linux-distro-smoke
     runs-on: ubuntu-latest
     steps:
       - name: Checkout release ref

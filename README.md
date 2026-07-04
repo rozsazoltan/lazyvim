@@ -48,7 +48,25 @@ That means you can use `lazyvim` without touching `~/.config/nvim` or your exist
 
 ### Install
 
-Download the executable for your platform from the latest GitHub Release and place it somewhere in your `PATH`.
+The recommended install method is [`bin`](https://github.com/marcosnils/bin), because this project publishes direct executable release assets. `bin` selects the asset that matches your platform and installs it into its binary directory.
+
+```sh
+bin install github.com/rozsazoltan/lazyvim
+```
+
+If `bin` cannot confidently select the right asset, show all matching release assets and choose one manually:
+
+```sh
+bin install -a github.com/rozsazoltan/lazyvim
+```
+
+For a prerelease or a specific version, install the release tag URL:
+
+```sh
+bin install github.com/rozsazoltan/lazyvim/releases/tag/v0.1.0
+```
+
+Manual installation works too. Download the executable for your platform from the latest GitHub Release and place it somewhere in your `PATH`.
 
 Linux x86_64:
 
@@ -217,6 +235,8 @@ The launcher sets these variables automatically before starting Neovim:
 If Linux prints a glibc error such as `GLIBC_2.xx not found`, install a newer LazyVim release. Linux builds are published from the `x86_64-unknown-linux-musl` Rust target, so the launcher should not require the glibc version from the GitHub Actions runner.
 
 If Windows prints `lazyvim: program not found`, the executable is not in your `PATH` under the name `lazyvim.exe`. Download `lazyvim-windows-x86_64.exe` as `lazyvim.exe`, place it in a directory included in `PATH`, and open a new terminal.
+
+If you installed with `bin` and the command is still not found, make sure `bin`'s binary directory is part of your `PATH`. By default, `bin` uses `~/.local/bin` on Linux/macOS and `%LOCALAPPDATA%\bin` on Windows.
 
 Run the built-in doctor command first:
 

@@ -1699,15 +1699,27 @@ fn doctor(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
     print_locations(runtime)?;
     println!();
 
-    check_command("nvim", &runtime.nvim, &["--version"], true, Some(&runtime.path_value))?;
-    check_command("zig", Path::new("zig"), &["version"], true, Some(&runtime.path_value))?;
-    check_command("cc", &compiler_wrapper_path(&runtime.home), &["--version"], true, Some(&runtime.path_value))?;
-    check_command("tree-sitter", Path::new("tree-sitter"), &["--version"], true, Some(&runtime.path_value))?;
-    check_command("git", Path::new("git"), &["--version"], true, Some(&runtime.path_value))?;
-    check_command("curl", Path::new("curl"), &["--version"], true, Some(&runtime.path_value))?;
-    check_command("rg", Path::new("rg"), &["--version"], true, Some(&runtime.path_value))?;
-    check_command("fd", Path::new("fd"), &["--version"], true, Some(&runtime.path_value))?;
-    check_command("lazygit", Path::new("lazygit"), &["--version"], true, Some(&runtime.path_value))?;
+    let mut failures = 0;
+
+    for check in [
+        check_command("nvim", &runtime.nvim, &["--version"], true, Some(&runtime.path_value))?,
+        check_command("zig", Path::new("zig"), &["version"], true, Some(&runtime.path_value))?,
+        check_command("cc", &compiler_wrapper_path(&runtime.home), &["--version"], true, Some(&runtime.path_value))?,
+        check_command("tree-sitter", Path::new("tree-sitter"), &["--version"], true, Some(&runtime.path_value))?,
+        check_command("git", Path::new("git"), &["--version"], true, Some(&runtime.path_value))?,
+        check_command("curl", Path::new("curl"), &["--version"], true, Some(&runtime.path_value))?,
+        check_command("rg", Path::new("rg"), &["--version"], true, Some(&runtime.path_value))?,
+        check_command("fd", Path::new("fd"), &["--version"], true, Some(&runtime.path_value))?,
+        check_command("lazygit", Path::new("lazygit"), &["--version"], true, Some(&runtime.path_value))?,
+    ] {
+        if !check {
+            failures += 1;
+        }
+    }
+
+    if failures > 0 {
+        return Err(format!("doctor found {failures} failing required check(s)").into());
+    }
 
     Ok(())
 }
@@ -1727,7 +1739,13 @@ fn print_locations(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-fn check_command(label: &str, command_path: &Path, args: &[&str], required: bool, path_value: Option<&OsString>) -> Result<(), Box<dyn std::error::Error>> {
+fn check_command(
+    label: &str,
+    command_path: &Path,
+    args: &[&str],
+    required: bool,
+    path_value: Option<&OsString>,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let mut command = Command::new(command_path);
     command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -1748,19 +1766,20 @@ fn check_command(label: &str, command_path: &Path, args: &[&str], required: bool
                 .unwrap_or("ok");
 
             println!("[ok]   {label}: {first_line}");
+            Ok(true)
         }
         Ok(output) => {
             let message = String::from_utf8_lossy(&output.stderr);
             let level = if required { "fail" } else { "warn" };
             println!("[{level}] {label}: exited with {} {}", output.status, message.trim());
+            Ok(!required)
         }
         Err(error) => {
             let level = if required { "fail" } else { "warn" };
             println!("[{level}] {label}: {error}");
+            Ok(!required)
         }
     }
-
-    Ok(())
 }
 
 fn print_help() {

@@ -377,6 +377,10 @@ cargo run -- --version
 cargo run -- where
 ```
 
+Changes that affect bootstrap, platform support, release assets, or managed dependencies should also pass the `Portable Smoke` workflow. It builds the executable on Linux, Windows, macOS Intel, and macOS Apple Silicon, runs `install-deps`, checks `doctor`, and optionally runs `sync` to catch LazyVim/Treesitter bootstrap failures before release.
+
+The release workflow runs the same smoke checks against the built release artifacts before creating the GitHub Release.
+
 Keep changes small and focused. User-facing behavior should stay portable by default and must not write into the user's normal Neovim config directories.
 
 ## License & Acknowledgments

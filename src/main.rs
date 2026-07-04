@@ -15,7 +15,7 @@ const RIPGREP_VERSION: &str = "15.1.0";
 const FD_VERSION: &str = "10.4.2";
 const FD_MACOS_X86_64_VERSION: &str = "10.3.0";
 const LAZYGIT_VERSION: &str = "0.62.2";
-const PORTABLE_TOOLCHAIN_STAMP: &str = "2026-07-04-portable-cc-v3";
+const PORTABLE_TOOLCHAIN_STAMP: &str = "2026-07-04-portable-cc-v4";
 const EMBEDDED_TREE_SITTER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/embedded-tree-sitter"));
 
 #[derive(Debug)]
@@ -947,13 +947,37 @@ fn run_compiler_wrapper() -> Result<i32, Box<dyn std::error::Error>> {
     let mode = compiler_wrapper_mode(&exe);
     let mut command = Command::new(zig);
     command.arg(mode);
-    command.args(env::args_os().skip(1));
+    command.args(sanitize_compiler_args(env::args_os().skip(1)));
     command.env("PATH", build_path(home, None)?);
-    command.env_remove("TARGET");
-    command.env_remove("CARGO_BUILD_TARGET");
+    clear_cargo_target_env(&mut command);
 
     let status = command.status()?;
     Ok(status.code().unwrap_or(1))
+}
+
+fn sanitize_compiler_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut sanitized = Vec::new();
+    let mut skip_next = false;
+
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
+        let arg_text = arg.to_string_lossy();
+        if arg_text == "-target" || arg_text == "--target" {
+            skip_next = true;
+            continue;
+        }
+        if arg_text.starts_with("--target=") {
+            continue;
+        }
+
+        sanitized.push(arg);
+    }
+
+    sanitized
 }
 
 fn compiler_wrapper_mode(exe: &Path) -> &'static str {
@@ -1787,6 +1811,28 @@ fn clear_macos_quarantine(install_dir: &Path) {
         .status();
 }
 
+fn clear_cargo_target_env(command: &mut Command) {
+    // tree-sitter's parser builder can pass Rust target triples such as
+    // x86_64-unknown-linux-musl or x86_64-pc-windows-msvc to CC. Zig uses its
+    // own target query format, so the portable compiler wrapper strips target
+    // flags and this removes the environment variables that commonly introduce
+    // those Rust triples in CI and cross-compiled binaries.
+    for name in [
+        "TARGET",
+        "HOST",
+        "BUILD_TARGET",
+        "BUILD_HOST",
+        "CARGO_BUILD_TARGET",
+        "CARGO_CFG_TARGET_ARCH",
+        "CARGO_CFG_TARGET_ENV",
+        "CARGO_CFG_TARGET_FAMILY",
+        "CARGO_CFG_TARGET_OS",
+        "CARGO_CFG_TARGET_VENDOR",
+    ] {
+        command.env_remove(name);
+    }
+}
+
 fn command_runs(command_path: &Path, args: &[&str], path_value: Option<&OsString>) -> bool {
     let mut command = Command::new(command_path);
     command.args(args).stdout(Stdio::null()).stderr(Stdio::null());
@@ -1816,8 +1862,7 @@ fn base_command(runtime: &Runtime) -> Command {
         .env("CC_KNOWN_WRAPPER_CUSTOM", "cc")
         .env("TREE_SITTER_CLI", tree_sitter_executable_path(&runtime.home));
 
-    command.env_remove("TARGET");
-    command.env_remove("CARGO_BUILD_TARGET");
+    clear_cargo_target_env(&mut command);
     command
 }
 
@@ -1973,4 +2018,54 @@ fn print_help() {
     println!("  LAZYVIM_HOME                Override ~/.lazyvim; use 'portable' for executable-local home");
     println!("  LAZYVIM_NVIM                Use a specific nvim executable");
     println!("  LAZYVIM_STARTER_REPOSITORY  Override the LazyVim starter repository");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn os_args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(|arg| OsString::from(*arg)).collect()
+    }
+
+    fn string_args(args: Vec<OsString>) -> Vec<String> {
+        args.into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn sanitize_compiler_args_removes_joined_target_flag() {
+        let args = sanitize_compiler_args(os_args(&[
+            "-O2",
+            "--target=x86_64-unknown-linux-musl",
+            "parser.c",
+        ]));
+
+        assert_eq!(string_args(args), vec![String::from("-O2"), String::from("parser.c")]);
+    }
+
+    #[test]
+    fn sanitize_compiler_args_removes_split_target_flag() {
+        let args = sanitize_compiler_args(os_args(&[
+            "-O2",
+            "-target",
+            "x86_64-pc-windows-msvc",
+            "parser.c",
+        ]));
+
+        assert_eq!(string_args(args), vec![String::from("-O2"), String::from("parser.c")]);
+    }
+
+    #[test]
+    fn sanitize_compiler_args_removes_split_double_dash_target_flag() {
+        let args = sanitize_compiler_args(os_args(&[
+            "-O2",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "parser.c",
+        ]));
+
+        assert_eq!(string_args(args), vec![String::from("-O2"), String::from("parser.c")]);
+    }
 }

@@ -173,9 +173,35 @@ jobs:
           echo "release_ref=${release_ref}" >> "$GITHUB_OUTPUT"
           echo "Release ref: ${release_ref}"
 
+  rust:
+    name: Rust checks
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.release_ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
   build:
     name: Build ${{ matrix.platform }}
-    needs: prepare
+    needs:
+      - prepare
+      - rust
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

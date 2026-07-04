@@ -27,7 +27,6 @@ struct Cli {
     command: CliCommand,
 }
 
-#[derive(Debug)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HomeSwitchAction {
     Prompt,
@@ -66,6 +65,7 @@ enum HomeRegistryWrite {
     Failed(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HomeComparison {
     Same,
     Different,

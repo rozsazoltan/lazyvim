@@ -9,6 +9,8 @@ const APP_NAME: &str = "lazyvim";
 const DEFAULT_HOME_DIR: &str = ".lazyvim";
 
 const STARTER_REPOSITORY: &str = "https://github.com/LazyVim/starter.git";
+const ZIG_VERSION: &str = "0.14.0";
+const TREE_SITTER_VERSION: &str = "0.26.10";
 
 #[derive(Debug)]
 struct Cli {
@@ -26,6 +28,7 @@ enum CliCommand {
     Update,
     Clean,
     InstallNvim,
+    InstallTools,
     Reset { yes: bool },
     Help,
     Version,
@@ -88,6 +91,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 CliCommand::Update => run_lazy_command(&runtime, "update"),
                 CliCommand::Clean => run_lazy_command(&runtime, "clean"),
                 CliCommand::InstallNvim => install_neovim_command(&runtime),
+                CliCommand::InstallTools => install_tools_command(&runtime),
                 CliCommand::Help | CliCommand::Version | CliCommand::Reset { .. } => unreachable!(),
             }
         }
@@ -127,6 +131,7 @@ fn parse_cli(mut args: Vec<String>) -> Cli {
         Some("update") => CliCommand::Update,
         Some("clean") => CliCommand::Clean,
         Some("install-nvim") => CliCommand::InstallNvim,
+        Some("install-tools") => CliCommand::InstallTools,
         Some("reset") => CliCommand::Reset {
             yes: args.iter().any(|arg| arg == "--yes" || arg == "-y"),
         },
@@ -173,6 +178,7 @@ fn prepare_runtime(home_override: Option<PathBuf>, bootstrap: bool) -> Result<Ru
             .into());
         }
 
+        ensure_managed_tools(&home, &path_value)?;
         ensure_starter_config(&config_dir)?;
     }
 
@@ -328,10 +334,12 @@ fn build_path(home: &Path, exe_dir: Option<&Path>) -> io::Result<OsString> {
     let mut paths = Vec::new();
 
     paths.push(home.join("nvim").join("bin"));
+    paths.push(home.join("tools").join("zig"));
     paths.push(home.join("bin"));
 
     if let Some(exe_dir) = exe_dir {
         paths.push(exe_dir.join("nvim").join("bin"));
+        paths.push(exe_dir.join("tools").join("zig"));
         paths.push(exe_dir.join("bin"));
     }
 
@@ -342,6 +350,12 @@ fn build_path(home: &Path, exe_dir: Option<&Path>) -> io::Result<OsString> {
     env::join_paths(paths).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
+
+fn install_tools_command(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_managed_tools(&runtime.home, &runtime.path_value)?;
+    println!("Installed portable LazyVim tools into {}", runtime.home.display());
+    Ok(())
+}
 
 fn install_neovim_command(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
     if command_runs(&runtime.nvim, &["--version"], Some(&runtime.path_value))
@@ -359,6 +373,288 @@ fn install_neovim_command(runtime: &Runtime) -> Result<(), Box<dyn std::error::E
     }
 
     println!("Installed Neovim into {}", runtime.home.join("nvim").display());
+    Ok(())
+}
+
+
+fn ensure_managed_tools(home: &Path, path_value: &OsString) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(home.join("tools"))?;
+    fs::create_dir_all(home.join("bin"))?;
+
+    let zig = zig_executable_path(home);
+    if !command_runs(&zig, &["version"], Some(path_value)) {
+        install_zig(home)?;
+    }
+
+    let tree_sitter = tree_sitter_executable_path(home);
+    if !command_runs(&tree_sitter, &["--version"], Some(path_value)) {
+        install_tree_sitter(home)?;
+    }
+
+    Ok(())
+}
+
+fn zig_executable_path(home: &Path) -> PathBuf {
+    home.join("tools").join("zig").join(if cfg!(windows) { "zig.exe" } else { "zig" })
+}
+
+fn tree_sitter_executable_path(home: &Path) -> PathBuf {
+    home.join("bin").join(if cfg!(windows) { "tree-sitter.exe" } else { "tree-sitter" })
+}
+
+fn install_zig(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let asset = zig_release_asset()?;
+    let url = format!("https://ziglang.org/download/{ZIG_VERSION}/{asset}");
+    let downloads_dir = home.join("downloads");
+    let archive_path = downloads_dir.join(asset);
+    let install_dir = home.join("tools").join("zig");
+    let temp_dir = home.join(".zig-install");
+
+    fs::create_dir_all(&downloads_dir)?;
+    println!("C compiler was not found. Downloading Zig {ZIG_VERSION} from {url}");
+    download_file(&url, &archive_path)?;
+    extract_archive_strip_first_directory(&archive_path, &temp_dir, &install_dir)?;
+    make_executable(&install_dir.join(if cfg!(windows) { "zig.exe" } else { "zig" }))?;
+
+    Ok(())
+}
+
+fn zig_release_asset() -> Result<String, Box<dyn std::error::Error>> {
+    if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+        return Ok(format!("zig-windows-x86_64-{ZIG_VERSION}.zip"));
+    }
+
+    if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+        return Ok(format!("zig-linux-x86_64-{ZIG_VERSION}.tar.xz"));
+    }
+
+    if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+        return Ok(format!("zig-macos-x86_64-{ZIG_VERSION}.tar.xz"));
+    }
+
+    if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        return Ok(format!("zig-macos-aarch64-{ZIG_VERSION}.tar.xz"));
+    }
+
+    Err("automatic Zig installation is not supported on this platform".into())
+}
+
+fn install_tree_sitter(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let asset = tree_sitter_release_asset()?;
+    let url = format!("https://github.com/tree-sitter/tree-sitter/releases/download/v{TREE_SITTER_VERSION}/{asset}");
+    let downloads_dir = home.join("downloads");
+    let archive_path = downloads_dir.join(asset);
+    let temp_dir = home.join(".tree-sitter-install");
+    let destination = tree_sitter_executable_path(home);
+
+    fs::create_dir_all(&downloads_dir)?;
+    println!("tree-sitter CLI was not found. Downloading tree-sitter {TREE_SITTER_VERSION} from {url}");
+    download_file(&url, &archive_path)?;
+    extract_tree_sitter_archive(&archive_path, &temp_dir, &destination)?;
+    make_executable(&destination)?;
+
+    Ok(())
+}
+
+fn tree_sitter_release_asset() -> Result<&'static str, Box<dyn std::error::Error>> {
+    if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+        return Ok("tree-sitter-cli-windows-x64.zip");
+    }
+
+    if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+        return Ok("tree-sitter-cli-linux-x64.zip");
+    }
+
+    if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+        return Ok("tree-sitter-cli-macos-x64.zip");
+    }
+
+    if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        return Ok("tree-sitter-cli-macos-arm64.zip");
+    }
+
+    Err("automatic tree-sitter CLI installation is not supported on this platform".into())
+}
+
+fn extract_archive_strip_first_directory(
+    archive_path: &Path,
+    temp_dir: &Path,
+    install_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if temp_dir.exists() {
+        fs::remove_dir_all(temp_dir)?;
+    }
+    fs::create_dir_all(temp_dir)?;
+
+    if cfg!(windows) {
+        extract_zip_with_powershell(archive_path, temp_dir, install_dir)?;
+    } else {
+        let status = Command::new("tar")
+            .arg("-xf")
+            .arg(archive_path)
+            .arg("--strip-components=1")
+            .arg("-C")
+            .arg(temp_dir)
+            .status()?;
+
+        if !status.success() {
+            return Err(format!("failed to extract {}: tar exited with {status}", archive_path.display()).into());
+        }
+
+        if install_dir.exists() {
+            fs::remove_dir_all(install_dir)?;
+        }
+        fs::rename(temp_dir, install_dir)?;
+    }
+
+    if temp_dir.exists() {
+        fs::remove_dir_all(temp_dir)?;
+    }
+
+    Ok(())
+}
+
+fn extract_tree_sitter_archive(
+    archive_path: &Path,
+    temp_dir: &Path,
+    destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if temp_dir.exists() {
+        fs::remove_dir_all(temp_dir)?;
+    }
+    fs::create_dir_all(temp_dir)?;
+
+    if cfg!(windows) {
+        extract_tree_sitter_with_powershell(archive_path, temp_dir, destination)?;
+    } else {
+        let extracted = extract_zip_with_available_tool(archive_path, temp_dir)?;
+        let source = find_extracted_tool(&extracted, if cfg!(windows) { "tree-sitter.exe" } else { "tree-sitter" })?;
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&source, destination)?;
+    }
+
+    if temp_dir.exists() {
+        fs::remove_dir_all(temp_dir)?;
+    }
+
+    Ok(())
+}
+
+fn extract_zip_with_available_tool(archive_path: &Path, temp_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let python = Command::new("python3")
+        .arg("-m")
+        .arg("zipfile")
+        .arg("-e")
+        .arg(archive_path)
+        .arg(temp_dir)
+        .status();
+
+    if matches!(python, Ok(status) if status.success()) {
+        return Ok(temp_dir.to_path_buf());
+    }
+
+    let unzip = Command::new("unzip")
+        .arg("-q")
+        .arg(archive_path)
+        .arg("-d")
+        .arg(temp_dir)
+        .status();
+
+    if matches!(unzip, Ok(status) if status.success()) {
+        return Ok(temp_dir.to_path_buf());
+    }
+
+    Err(format!(
+        "failed to extract {}: install python3 or unzip, or place tree-sitter manually in ~/.lazyvim/bin",
+        archive_path.display()
+    )
+    .into())
+}
+
+fn find_extracted_tool(root: &Path, executable_name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(path) = stack.pop() {
+        for entry in fs::read_dir(&path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                stack.push(entry_path);
+            } else if entry_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == executable_name)
+            {
+                return Ok(entry_path);
+            }
+        }
+    }
+
+    Err(format!("could not find {executable_name} in extracted archive").into())
+}
+
+fn extract_tree_sitter_with_powershell(
+    archive_path: &Path,
+    temp_dir: &Path,
+    destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$archive = $env:LAZYVIM_TREE_SITTER_ARCHIVE
+$temp = $env:LAZYVIM_TREE_SITTER_TEMP
+$dest = $env:LAZYVIM_TREE_SITTER_DEST
+
+if (Test-Path -LiteralPath $temp) {
+    Remove-Item -LiteralPath $temp -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path $temp | Out-Null
+Expand-Archive -LiteralPath $archive -DestinationPath $temp -Force
+
+$tool = Get-ChildItem -LiteralPath $temp -Recurse -File | Where-Object { $_.Name -eq 'tree-sitter.exe' -or $_.Name -like 'tree-sitter*.exe' } | Select-Object -First 1
+if ($null -eq $tool) {
+    throw "Could not find tree-sitter.exe in extracted archive"
+}
+
+$parent = Split-Path -Parent $dest
+New-Item -ItemType Directory -Force -Path $parent | Out-Null
+Copy-Item -LiteralPath $tool.FullName -Destination $dest -Force
+"#;
+
+    let status = Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(script)
+        .env("LAZYVIM_TREE_SITTER_ARCHIVE", archive_path)
+        .env("LAZYVIM_TREE_SITTER_TEMP", temp_dir)
+        .env("LAZYVIM_TREE_SITTER_DEST", destination)
+        .status()?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to extract {}: PowerShell exited with {status}",
+            archive_path.display()
+        )
+        .into())
+    }
+}
+
+fn make_executable(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path.exists() {
+            let mut permissions = fs::metadata(path)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -586,12 +882,14 @@ fn doctor(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
     print_locations(runtime)?;
     println!();
 
-    check_command("nvim", &runtime.nvim, &["--version"], true)?;
-    check_path_tool("git", &["--version"])?;
-    check_path_tool("curl", &["--version"])?;
-    check_path_tool("rg", &["--version"])?;
-    check_path_tool("fd", &["--version"])?;
-    check_path_tool("lazygit", &["--version"])?;
+    check_command("nvim", &runtime.nvim, &["--version"], true, Some(&runtime.path_value))?;
+    check_command("zig", Path::new("zig"), &["version"], true, Some(&runtime.path_value))?;
+    check_command("tree-sitter", Path::new("tree-sitter"), &["--version"], true, Some(&runtime.path_value))?;
+    check_path_tool("git", &["--version"], &runtime.path_value)?;
+    check_path_tool("curl", &["--version"], &runtime.path_value)?;
+    check_path_tool("rg", &["--version"], &runtime.path_value)?;
+    check_path_tool("fd", &["--version"], &runtime.path_value)?;
+    check_path_tool("lazygit", &["--version"], &runtime.path_value)?;
 
     Ok(())
 }
@@ -611,16 +909,19 @@ fn print_locations(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-fn check_path_tool(name: &str, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-    check_command(name, Path::new(name), args, false)
+fn check_path_tool(name: &str, args: &[&str], path_value: &OsString) -> Result<(), Box<dyn std::error::Error>> {
+    check_command(name, Path::new(name), args, false, Some(path_value))
 }
 
-fn check_command(label: &str, command_path: &Path, args: &[&str], required: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let output = Command::new(command_path)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+fn check_command(label: &str, command_path: &Path, args: &[&str], required: bool, path_value: Option<&OsString>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::new(command_path);
+    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    if let Some(path_value) = path_value {
+        command.env("PATH", path_value);
+    }
+
+    let output = command.output();
 
     match output {
         Ok(output) if output.status.success() => {
@@ -662,7 +963,8 @@ fn print_help() {
     println!("  restore    Run Lazy restore in headless mode");
     println!("  update     Run Lazy update in headless mode");
     println!("  clean      Run Lazy clean in headless mode");
-    println!("  install-nvim Install Neovim into the portable home");
+    println!("  install-nvim  Install Neovim into the portable home");
+    println!("  install-tools Install Zig and tree-sitter into the portable home");
     println!("  reset      Delete the portable home directory; requires --yes");
     println!("  help       Print this help");
     println!();

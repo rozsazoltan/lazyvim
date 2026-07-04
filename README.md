@@ -78,11 +78,10 @@ The launcher resolves Neovim in this order:
 
 ## Release workflow
 
-The manual release workflow accepts a version input, updates repository version files on `chore/release-{version}`, creates a pull request, squash-merges it into `master` when there are changes, builds platform executables, and creates the GitHub Release only after all build jobs succeed.
+The manual release workflow accepts a version input and a target branch input. It updates repository version files on `chore/release-{version}`, creates a pull request, squash-merges it into the selected target branch when there are changes, builds platform executables, and creates the GitHub Release only after all build jobs succeed.
 
 Required repository settings:
 
-- Default branch: `master`
 - GitHub Actions workflow permissions: read/write
 - Squash merge enabled
 - `GITHUB_TOKEN` must be allowed to create pull requests and write contents
@@ -98,8 +97,11 @@ Inputs:
 | Input | Example | Description |
 | --- | --- | --- |
 | `version` | `0.1.1` | SemVer version without leading `v`. |
+| `target_branch` | `master` | Branch to release from and squash-merge version updates into. |
 | `neovim_version` | `stable` | Neovim release tag to bundle, for example `stable`, `nightly`, or `v0.12.2`. |
 | `bundle_neovim` | `true` | Whether to download and include Neovim in the release package. |
+| `draft` | `false` | Whether to create the GitHub Release as a draft. |
+| `prerelease` | `false` | Whether to mark the GitHub Release as a prerelease. |
 
 ## Local development
 

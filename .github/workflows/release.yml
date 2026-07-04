@@ -7,6 +7,11 @@ on:
         description: "Version to release, without leading v. Example: 0.1.1"
         required: true
         type: string
+      target_branch:
+        description: "Branch to release from and squash-merge version updates into"
+        required: true
+        default: master
+        type: string
       neovim_version:
         description: "Neovim release tag to bundle. Example: stable, nightly, v0.12.2"
         required: true
@@ -17,18 +22,27 @@ on:
         required: true
         default: true
         type: boolean
+      draft:
+        description: "Create the GitHub Release as a draft"
+        required: true
+        default: false
+        type: boolean
+      prerelease:
+        description: "Mark the GitHub Release as a prerelease"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
   pull-requests: write
 
 concurrency:
-  group: release-${{ inputs.version }}
+  group: release-${{ inputs.target_branch }}-${{ inputs.version }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
-  BASE_BRANCH: master
 
 jobs:
   prepare:
@@ -43,7 +57,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.BASE_BRANCH }}
+          ref: ${{ inputs.target_branch }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -91,6 +105,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.meta.outputs.version }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
         shell: bash
         run: |
           set -euo pipefail
@@ -104,15 +119,25 @@ jobs:
           git commit -m "$title"
           git push --force-with-lease origin "$branch"
 
-          if gh pr view "$branch" --json number --jq .number >/tmp/pr-number 2>/dev/null; then
-            pr_number="$(cat /tmp/pr-number)"
-          else
+          pr_number="$(gh pr list \
+            --state open \
+            --head "$branch" \
+            --base "$TARGET_BRANCH" \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          if [[ -z "$pr_number" ]]; then
             gh pr create \
-              --base "${BASE_BRANCH}" \
+              --base "$TARGET_BRANCH" \
               --head "$branch" \
               --title "$title" \
               --body "Automated release preparation for ${VERSION}."
-            pr_number="$(gh pr view "$branch" --json number --jq .number)"
+            pr_number="$(gh pr list \
+              --state open \
+              --head "$branch" \
+              --base "$TARGET_BRANCH" \
+              --json number \
+              --jq '.[0].number')"
           fi
 
           gh pr merge "$pr_number" \
@@ -126,8 +151,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin "${BASE_BRANCH}"
-          release_ref="$(git rev-parse "origin/${BASE_BRANCH}")"
+          git fetch origin "${{ inputs.target_branch }}"
+          release_ref="$(git rev-parse "origin/${{ inputs.target_branch }}")"
           echo "release_ref=${release_ref}" >> "$GITHUB_OUTPUT"
           echo "Release ref: ${release_ref}"
 
@@ -235,11 +260,22 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.tag }}
           RELEASE_REF: ${{ needs.prepare.outputs.release_ref }}
+          DRAFT: ${{ inputs.draft }}
+          PRERELEASE: ${{ inputs.prerelease }}
         shell: bash
         run: |
           set -euo pipefail
           mapfile -t assets < <(find dist/artifacts -type f | sort)
+          release_flags=()
+          if [[ "$DRAFT" == "true" ]]; then
+            release_flags+=(--draft)
+          fi
+          if [[ "$PRERELEASE" == "true" ]]; then
+            release_flags+=(--prerelease)
+          fi
+
           gh release create "$TAG" "${assets[@]}" \
             --target "$RELEASE_REF" \
             --title "$TAG" \
-            --notes-file dist/release-notes.md
+            --notes-file dist/release-notes.md \
+            "${release_flags[@]}"

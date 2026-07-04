@@ -41,7 +41,7 @@ The launcher prepares the portable directory on first run, checks required syste
 ~/.lazyvim/data/lazyvim     # plugins, lazy.nvim, Mason packages
 ~/.lazyvim/state/lazyvim    # Neovim state
 ~/.lazyvim/cache/lazyvim    # cache
-~/.lazyvim/bin              # launcher-managed CLI tools and compiler wrappers
+~/.lazyvim/bin              # launcher-managed CLI tools and native compiler wrappers
 ~/.lazyvim/tools/zig        # launcher-managed Zig compiler
 ```
 
@@ -114,7 +114,7 @@ lazyvim --version
 The last `$env:Path` line makes `lazyvim` available in the current terminal session. New terminals will pick it up from the user `PATH`.
 
 > [!IMPORTANT]
-> The release asset is the `lazyvim` launcher executable. On first run, it prepares the missing dependencies it can manage automatically. It downloads the official Neovim release, installs Zig, adds `cc`/`gcc`/`clang` wrappers through `zig cc`, installs `tree-sitter`, `rg`, `fd`, and `lazygit`, then fetches the official LazyVim starter config. If Git or curl are missing, the launcher tries to install them with the native package manager first.
+> The release asset is the `lazyvim` launcher executable. On first run, it prepares the missing dependencies it can manage automatically. It downloads the official Neovim release, installs Zig, adds native `cc`/`gcc`/`clang` wrappers backed by `zig cc`, installs `tree-sitter`, `rg`, `fd`, and `lazygit`, then fetches the official LazyVim starter config. If Git or curl are missing, the launcher tries to install them with the native package manager first.
 
 Release checksums are published as `SHA256SUMS` next to the executables. The Linux x86_64 executable is built with the musl target to avoid depending on the glibc version installed by a specific distribution.
 
@@ -274,9 +274,10 @@ LazyVim needs external tooling during the first plugin install. The launcher kee
 
 ```text
 $LAZYVIM_HOME/tools/zig        # portable Zig compiler
-$LAZYVIM_HOME/bin/cc           # wrapper around zig cc
-$LAZYVIM_HOME/bin/gcc          # wrapper around zig cc
-$LAZYVIM_HOME/bin/clang        # wrapper around zig cc
+$LAZYVIM_HOME/bin/cc           # native launcher wrapper around zig cc
+$LAZYVIM_HOME/bin/gcc          # native launcher wrapper around zig cc
+$LAZYVIM_HOME/bin/clang        # native launcher wrapper around zig cc
+$LAZYVIM_HOME/bin/c++          # native launcher wrapper around zig c++
 $LAZYVIM_HOME/bin/tree-sitter  # tree-sitter CLI
 $LAZYVIM_HOME/bin/rg           # ripgrep
 $LAZYVIM_HOME/bin/fd           # fd
@@ -305,7 +306,9 @@ Install or repair only the managed portable tools:
 lazyvim install-tools
 ```
 
-The managed tool directories are prepended to `PATH` when Neovim is started, so LazyVim sees them before broken or incompatible system tools.
+The managed tool directories are prepended to `PATH` when Neovim is started, so LazyVim sees them before broken or incompatible system tools. The launcher also sets `CC`, `CXX`, and `TREE_SITTER_CLI` for Neovim so nvim-treesitter builds parsers with the portable toolchain instead of falling back to a missing or incompatible system compiler.
+
+When the portable compiler wrapper changes, the launcher clears previously compiled Treesitter parser output once so broken `.so`/`.dll` files are rebuilt with the managed compiler.
 
 ### Environment variables
 
@@ -324,6 +327,9 @@ The launcher sets these variables automatically before starting Neovim:
 | `XDG_DATA_HOME` | `$LAZYVIM_HOME/data` |
 | `XDG_STATE_HOME` | `$LAZYVIM_HOME/state` |
 | `XDG_CACHE_HOME` | `$LAZYVIM_HOME/cache` |
+| `CC` | `$LAZYVIM_HOME/bin/cc` |
+| `CXX` | `$LAZYVIM_HOME/bin/c++` |
+| `TREE_SITTER_CLI` | `$LAZYVIM_HOME/bin/tree-sitter` |
 
 ## Troubleshooting
 
@@ -340,6 +346,8 @@ lazyvim doctor
 ```
 
 The first run needs Git for lazy.nvim plugin installation and curl for parts of the LazyVim stack. The launcher checks them and attempts native installation when they are missing. LazyVim extras may still need project-specific tools such as language runtimes, package managers, formatters, linters, and LSP servers.
+
+If nvim-treesitter reports `program not found`, `gcc program not found`, or a parser dynamic library error, install or repair the managed tools. The launcher will rebuild the parser output on the next run when the portable toolchain stamp changes.
 
 If Neovim or managed dependencies cannot be found, run the built-in installers or point the launcher to a binary:
 

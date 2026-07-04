@@ -14,6 +14,7 @@ const TREE_SITTER_VERSION: &str = "0.26.10";
 const RIPGREP_VERSION: &str = "15.1.0";
 const FD_VERSION: &str = "10.4.2";
 const LAZYGIT_VERSION: &str = "0.62.2";
+const PORTABLE_TOOLCHAIN_STAMP: &str = "2026-07-04-portable-cc-v2";
 
 #[derive(Debug)]
 struct Cli {
@@ -53,6 +54,16 @@ struct Runtime {
 }
 
 fn main() {
+    if is_compiler_wrapper_invocation() {
+        match run_compiler_wrapper() {
+            Ok(code) => exit(code),
+            Err(error) => {
+                eprintln!("lazyvim compiler wrapper: {error}");
+                exit(1);
+            }
+        }
+    }
+
     if let Err(error) = run() {
         eprintln!("lazyvim: {error}");
         exit(1);
@@ -210,7 +221,9 @@ fn prepare_runtime(
         }
 
         ensure_managed_tools(&home, &path_value)?;
+        ensure_treesitter_cache_for_current_toolchain(&data_home, &state_home)?;
         ensure_starter_config(&config_dir)?;
+        ensure_portable_lazyvim_config(&config_dir)?;
     }
 
     Ok(Runtime {
@@ -769,8 +782,8 @@ fn build_path(home: &Path, exe_dir: Option<&Path>) -> io::Result<OsString> {
     let mut paths = Vec::new();
 
     paths.push(home.join("nvim").join("bin"));
-    paths.push(home.join("tools").join("zig"));
     paths.push(home.join("bin"));
+    paths.push(home.join("tools").join("zig"));
 
     if cfg!(windows) {
         paths.push(PathBuf::from(r"C:\Program Files\Git\cmd"));
@@ -785,8 +798,8 @@ fn build_path(home: &Path, exe_dir: Option<&Path>) -> io::Result<OsString> {
 
     if let Some(exe_dir) = exe_dir {
         paths.push(exe_dir.join("nvim").join("bin"));
-        paths.push(exe_dir.join("tools").join("zig"));
         paths.push(exe_dir.join("bin"));
+        paths.push(exe_dir.join("tools").join("zig"));
     }
 
     if let Some(existing) = env::var_os("PATH") {
@@ -870,24 +883,71 @@ fn managed_tool_path(home: &Path, executable_name: &str) -> PathBuf {
 fn install_c_compiler_wrappers(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let bin_dir = home.join("bin");
     fs::create_dir_all(&bin_dir)?;
-    let zig = zig_executable_path(home);
 
-    if cfg!(windows) {
-        for name in ["cc.cmd", "gcc.cmd", "clang.cmd", "cc.bat", "gcc.bat", "clang.bat"] {
-            let wrapper = bin_dir.join(name);
-            let content = format!("@echo off\r\n\"{}\" cc %*\r\n", zig.display());
-            fs::write(wrapper, content)?;
-        }
+    let launcher = env::current_exe()?;
+    let wrapper_names: &[&str] = if cfg!(windows) {
+        &["cc.exe", "gcc.exe", "clang.exe", "c++.exe", "g++.exe", "clang++.exe"]
     } else {
-        for name in ["cc", "gcc", "clang"] {
-            let wrapper = bin_dir.join(name);
-            let content = format!("#!/bin/sh\nexec \"{}\" cc \"$@\"\n", zig.display());
-            fs::write(&wrapper, content)?;
-            make_executable(&wrapper)?;
-        }
+        &["cc", "gcc", "clang", "c++", "g++", "clang++"]
+    };
+
+    for name in wrapper_names {
+        install_launcher_wrapper(&launcher, &bin_dir.join(name))?;
     }
 
     Ok(())
+}
+
+fn install_launcher_wrapper(source: &Path, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if destination.exists() {
+        fs::remove_file(destination)?;
+    }
+
+    if fs::hard_link(source, destination).is_err() {
+        fs::copy(source, destination)?;
+    }
+
+    make_executable(destination)?;
+    Ok(())
+}
+
+fn is_compiler_wrapper_invocation() -> bool {
+    let Ok(exe) = env::current_exe() else {
+        return false;
+    };
+
+    let Some(stem) = exe.file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+
+    matches!(stem, "cc" | "gcc" | "clang" | "c++" | "g++" | "clang++")
+}
+
+fn run_compiler_wrapper() -> Result<i32, Box<dyn std::error::Error>> {
+    let exe = env::current_exe()?;
+    let bin_dir = exe.parent().ok_or("compiler wrapper has no parent directory")?;
+    let home = bin_dir.parent().ok_or("compiler wrapper is not inside a LazyVim home bin directory")?;
+    let zig = zig_executable_path(home);
+
+    if !zig.exists() {
+        return Err(format!("Zig compiler was not found at {}", zig.display()).into());
+    }
+
+    let mode = compiler_wrapper_mode(&exe);
+    let mut command = Command::new(zig);
+    command.arg(mode);
+    command.args(env::args_os().skip(1));
+    command.env("PATH", build_path(home, None)?);
+
+    let status = command.status()?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn compiler_wrapper_mode(exe: &Path) -> &'static str {
+    match exe.file_stem().and_then(|value| value.to_str()) {
+        Some("c++" | "g++" | "clang++") => "c++",
+        _ => "cc",
+    }
 }
 
 fn zig_executable_path(home: &Path) -> PathBuf {
@@ -896,6 +956,70 @@ fn zig_executable_path(home: &Path) -> PathBuf {
 
 fn tree_sitter_executable_path(home: &Path) -> PathBuf {
     home.join("bin").join(if cfg!(windows) { "tree-sitter.exe" } else { "tree-sitter" })
+}
+
+
+fn compiler_wrapper_path(home: &Path) -> PathBuf {
+    home.join("bin").join(if cfg!(windows) { "cc.exe" } else { "cc" })
+}
+
+fn cxx_compiler_wrapper_path(home: &Path) -> PathBuf {
+    home.join("bin").join(if cfg!(windows) { "c++.exe" } else { "c++" })
+}
+
+fn ensure_treesitter_cache_for_current_toolchain(
+    data_home: &Path,
+    state_home: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state_dir = state_home.join(APP_NAME);
+    let stamp_path = state_dir.join("portable-toolchain-stamp");
+
+    if matches!(fs::read_to_string(&stamp_path), Ok(value) if value == PORTABLE_TOOLCHAIN_STAMP) {
+        return Ok(());
+    }
+
+    let data_dir = data_home.join(APP_NAME);
+    for path in [
+        data_dir.join("site").join("parser"),
+        data_dir.join("lazy").join("nvim-treesitter").join("parser"),
+        data_dir.join("lazy").join("nvim-treesitter").join("parser-info"),
+    ] {
+        if path.exists() {
+            fs::remove_dir_all(&path)?;
+        }
+    }
+
+    fs::create_dir_all(&state_dir)?;
+    fs::write(stamp_path, PORTABLE_TOOLCHAIN_STAMP)?;
+    Ok(())
+}
+
+fn ensure_portable_lazyvim_config(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let plugins_dir = config_dir.join("lua").join("plugins");
+    fs::create_dir_all(&plugins_dir)?;
+
+    let portable_plugin = plugins_dir.join("portable.lua");
+    let contents = r#"-- Generated by the portable LazyVim launcher.
+-- This keeps Treesitter parser builds inside the managed toolchain.
+return {
+  {
+    "nvim-treesitter/nvim-treesitter",
+    init = function()
+      local ok, install = pcall(require, "nvim-treesitter.install")
+      if ok then
+        install.compilers = { vim.env.CC or "cc", "zig", "clang", "gcc", "cc" }
+      end
+    end,
+    opts = function(_, opts)
+      opts.install = opts.install or {}
+      opts.install.compilers = { vim.env.CC or "cc", "zig", "clang", "gcc", "cc" }
+    end,
+  },
+}
+"#;
+
+    fs::write(portable_plugin, contents)?;
+    Ok(())
 }
 
 
@@ -1542,7 +1666,10 @@ fn base_command(runtime: &Runtime) -> Command {
         .env("XDG_DATA_HOME", &runtime.data_home)
         .env("XDG_STATE_HOME", &runtime.state_home)
         .env("XDG_CACHE_HOME", &runtime.cache_home)
-        .env("PATH", &runtime.path_value);
+        .env("PATH", &runtime.path_value)
+        .env("CC", compiler_wrapper_path(&runtime.home))
+        .env("CXX", cxx_compiler_wrapper_path(&runtime.home))
+        .env("TREE_SITTER_CLI", tree_sitter_executable_path(&runtime.home));
 
     command
 }
@@ -1574,7 +1701,7 @@ fn doctor(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
 
     check_command("nvim", &runtime.nvim, &["--version"], true, Some(&runtime.path_value))?;
     check_command("zig", Path::new("zig"), &["version"], true, Some(&runtime.path_value))?;
-    check_command("cc", Path::new("cc"), &["--version"], true, Some(&runtime.path_value))?;
+    check_command("cc", &compiler_wrapper_path(&runtime.home), &["--version"], true, Some(&runtime.path_value))?;
     check_command("tree-sitter", Path::new("tree-sitter"), &["--version"], true, Some(&runtime.path_value))?;
     check_command("git", Path::new("git"), &["--version"], true, Some(&runtime.path_value))?;
     check_command("curl", Path::new("curl"), &["--version"], true, Some(&runtime.path_value))?;

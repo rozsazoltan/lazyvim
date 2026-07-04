@@ -32,9 +32,10 @@ By default, everything is stored under:
 ~/.lazyvim
 ```
 
-The launcher prepares the portable directory on first run, clones the official [LazyVim starter](https://github.com/LazyVim/starter) config if it does not exist yet, removes its `.git` directory, then starts Neovim with dedicated XDG paths:
+The launcher prepares the portable directory on first run, installs Neovim into the portable home if no usable `nvim` is available, clones the official [LazyVim starter](https://github.com/LazyVim/starter) config if it does not exist yet, removes its `.git` directory, then starts Neovim with dedicated XDG paths:
 
 ```text
+~/.lazyvim/nvim             # launcher-managed Neovim installation
 ~/.lazyvim/config/lazyvim   # LazyVim config
 ~/.lazyvim/data/lazyvim     # plugins, lazy.nvim, Mason packages
 ~/.lazyvim/state/lazyvim    # Neovim state
@@ -111,7 +112,7 @@ lazyvim --version
 The last `$env:Path` line makes `lazyvim` available in the current terminal session. New terminals will pick it up from the user `PATH`.
 
 > [!IMPORTANT]
-> The release asset is the `lazyvim` launcher executable. It manages the portable LazyVim home, but it still starts Neovim. Install Neovim normally, put `nvim` in `~/.lazyvim/bin`, or set `LAZYVIM_NVIM` if the launcher cannot find it. The first run also needs Git so the launcher can fetch the official LazyVim starter config.
+> The release asset is the `lazyvim` launcher executable. On first run, it downloads the official Neovim release into `~/.lazyvim/nvim` when no usable `nvim` is available. The first run needs Git so the launcher can fetch the official LazyVim starter config, and curl plus the platform archive tool to download and extract Neovim.
 
 Release checksums are published as `SHA256SUMS` next to the executables. The Linux x86_64 executable is built with the musl target to avoid depending on the glibc version installed by a specific distribution.
 
@@ -123,7 +124,7 @@ Open any project directory and run:
 lazyvim .
 ```
 
-The first run creates the portable home, fetches the official LazyVim starter config, and lets LazyVim/lazy.nvim install plugins into `~/.lazyvim`.
+The first run creates the portable home, installs Neovim into `~/.lazyvim/nvim` if needed, fetches the official LazyVim starter config, and lets LazyVim/lazy.nvim install plugins into `~/.lazyvim`.
 
 ### Upgrade
 
@@ -161,6 +162,7 @@ lazyvim sync      # install and sync plugins
 lazyvim restore   # restore plugins from the lockfile
 lazyvim update    # update plugins
 lazyvim clean     # remove unused plugins
+lazyvim install-nvim  # install Neovim into ~/.lazyvim/nvim
 ```
 
 These commands run lazy.nvim in headless mode and use the same portable home as normal editor sessions.
@@ -207,10 +209,17 @@ The launcher looks for Neovim in this order:
 1. `LAZYVIM_NVIM`
 2. `nvim/bin/nvim` next to the launcher executable
 3. `bin/nvim` next to the launcher executable
-4. `~/.lazyvim/bin/nvim`
-5. `nvim` from `PATH`
+4. `~/.lazyvim/nvim/bin/nvim`
+5. `~/.lazyvim/bin/nvim`
+6. `nvim` from `PATH`
 
-This keeps the release itself as a single executable while still allowing custom or manually bundled Neovim layouts.
+If none of these works during a normal launch, the launcher downloads the official Neovim release for the current platform into `~/.lazyvim/nvim` and then starts it from there. You can also install it explicitly:
+
+```sh
+lazyvim install-nvim
+```
+
+This keeps the release itself as a single executable while still giving users a working portable Neovim runtime when the system does not provide one.
 
 ### Environment variables
 
@@ -246,11 +255,14 @@ lazyvim doctor
 
 The first run needs Git to clone the LazyVim starter config. LazyVim plugins may also need external developer tools depending on the enabled extras and the project you open. Common examples are curl, ripgrep, fd, a C compiler, language runtimes, package managers, formatters, linters, and LSP servers.
 
-If Neovim cannot be found, either install Neovim normally or point the launcher to a binary:
+If Neovim cannot be found, run the built-in installer or point the launcher to a binary:
 
 ```sh
+lazyvim install-nvim
 LAZYVIM_NVIM=/path/to/nvim lazyvim .
 ```
+
+The automatic installer downloads the official Neovim release asset for the current platform and extracts it into `~/.lazyvim/nvim`.
 
 If you want a completely fresh LazyVim profile:
 

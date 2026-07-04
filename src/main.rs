@@ -68,7 +68,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         CliCommand::Reset { yes } => {
-            let runtime = prepare_runtime(cli.home, cli.portable_home, false)?;
+            let runtime = prepare_runtime(cli.home, cli.portable_home, false, false)?;
             if !yes {
                 println!("This will delete: {}", runtime.home.display());
                 println!("Run `lazyvim reset --yes` to confirm.");
@@ -82,7 +82,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         command => {
             let bootstrap = !matches!(command, CliCommand::Doctor | CliCommand::Where);
-            let runtime = prepare_runtime(cli.home, cli.portable_home, bootstrap)?;
+            let runtime = prepare_runtime(cli.home, cli.portable_home, bootstrap, true)?;
             match command {
                 CliCommand::Launch(args) => launch_nvim(&runtime, &args),
                 CliCommand::Doctor => doctor(&runtime),
@@ -159,12 +159,19 @@ fn prepare_runtime(
     home_override: Option<PathBuf>,
     portable_home: bool,
     bootstrap: bool,
+    migrate_custom_home: bool,
 ) -> Result<Runtime, Box<dyn std::error::Error>> {
     let exe_dir = env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf));
 
+    let uses_custom_home = portable_home || home_override.is_some() || env::var_os("LAZYVIM_HOME").is_some();
     let home = resolve_home(home_override, portable_home, exe_dir.as_deref())?;
+
+    if migrate_custom_home && uses_custom_home {
+        migrate_default_home_if_needed(&home)?;
+    }
+
     let config_home = home.join("config");
     let data_home = home.join("data");
     let state_home = home.join("state");
@@ -262,6 +269,109 @@ fn is_portable_home_alias(value: &str) -> bool {
 fn home_next_to_executable(exe_dir: Option<&Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let exe_dir = exe_dir.ok_or("could not resolve launcher executable directory")?;
     Ok(exe_dir.join(DEFAULT_HOME_DIR))
+}
+
+fn migrate_default_home_if_needed(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let source = user_home_dir()?.join(DEFAULT_HOME_DIR);
+    let source = absolute_path(source)?;
+    let destination = absolute_path(destination.to_path_buf())?;
+
+    if source == destination || !source.exists() || destination.exists() {
+        return Ok(());
+    }
+
+    if destination.starts_with(&source) {
+        return Err(format!(
+            "cannot move {} into itself at {}",
+            source.display(),
+            destination.display()
+        )
+        .into());
+    }
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    println!(
+        "Moving portable home from {} to {}",
+        source.display(),
+        destination.display()
+    );
+
+    move_directory(&source, &destination)?;
+    Ok(())
+}
+
+fn move_directory(source: &Path, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            copy_directory(source, destination).map_err(|copy_error| {
+                format!(
+                    "failed to move {} to {}: rename failed with {}; copy fallback failed with {}",
+                    source.display(),
+                    destination.display(),
+                    rename_error,
+                    copy_error
+                )
+            })?;
+            fs::remove_dir_all(source)?;
+            Ok(())
+        }
+    }
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::create_dir_all(destination)?;
+
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            copy_directory(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &destination_path)?;
+        } else if file_type.is_symlink() {
+            copy_symlink(&source_path, &destination_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let target = fs::read_link(source)?;
+    if destination.exists() {
+        fs::remove_file(destination)?;
+    }
+    symlink(target, destination)
+}
+
+#[cfg(windows)]
+fn copy_symlink(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+
+    let target = fs::read_link(source)?;
+    if destination.exists() {
+        if destination.is_dir() {
+            fs::remove_dir(destination)?;
+        } else {
+            fs::remove_file(destination)?;
+        }
+    }
+
+    if source.is_dir() {
+        symlink_dir(target, destination)
+    } else {
+        symlink_file(target, destination)
+    }
 }
 
 fn absolute_path(path: PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>> {

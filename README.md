@@ -220,12 +220,15 @@ You can also persist any custom path with an environment variable:
 LAZYVIM_HOME=~/.work-lazyvim lazyvim .
 ```
 
-To move an existing portable home, move the directory first and then point the launcher at the new location:
+When you switch from the default `~/.lazyvim` home to a custom home, the launcher moves the existing default home automatically if the target directory does not exist yet:
 
 ```sh
-mv ~/.lazyvim /opt/lazyvim
 LAZYVIM_HOME=/opt/lazyvim lazyvim .
+lazyvim --home /opt/lazyvim .
+lazyvim --portable-home .
 ```
+
+This keeps existing config, plugins, Neovim, managed tools, cache, state, and Mason packages instead of starting from an empty profile. If the target home already exists, the launcher does not overwrite it.
 
 Print the resolved locations:
 

@@ -48,49 +48,46 @@ That means you can use `lazyvim` without touching `~/.config/nvim` or your exist
 
 ### Install
 
-Download the package for your platform from the latest GitHub Release, extract it, and place the `lazyvim` executable somewhere in your `PATH`.
+Download the executable for your platform from the latest GitHub Release and place it somewhere in your `PATH`.
 
 Linux x86_64:
 
 ```sh
 mkdir -p ~/.local/bin
-tmp="$(mktemp -d)"
-curl -fL https://github.com/rozsazoltan/lazyvim/releases/latest/download/lazyvim-linux-x86_64.tar.gz -o "$tmp/lazyvim.tar.gz"
-tar -xzf "$tmp/lazyvim.tar.gz" -C "$tmp"
-install -m 755 "$tmp"/lazyvim-*/lazyvim ~/.local/bin/lazyvim
+curl -fL https://github.com/rozsazoltan/lazyvim/releases/latest/download/lazyvim-linux-x86_64 -o ~/.local/bin/lazyvim
+chmod +x ~/.local/bin/lazyvim
 ```
 
 macOS Apple Silicon:
 
 ```sh
 mkdir -p ~/.local/bin
-tmp="$(mktemp -d)"
-curl -fL https://github.com/rozsazoltan/lazyvim/releases/latest/download/lazyvim-macos-arm64.tar.gz -o "$tmp/lazyvim.tar.gz"
-tar -xzf "$tmp/lazyvim.tar.gz" -C "$tmp"
-install -m 755 "$tmp"/lazyvim-*/lazyvim ~/.local/bin/lazyvim
+curl -fL https://github.com/rozsazoltan/lazyvim/releases/latest/download/lazyvim-macos-arm64 -o ~/.local/bin/lazyvim
+chmod +x ~/.local/bin/lazyvim
 ```
 
 macOS Intel:
 
 ```sh
 mkdir -p ~/.local/bin
-tmp="$(mktemp -d)"
-curl -fL https://github.com/rozsazoltan/lazyvim/releases/latest/download/lazyvim-macos-x86_64.tar.gz -o "$tmp/lazyvim.tar.gz"
-tar -xzf "$tmp/lazyvim.tar.gz" -C "$tmp"
-install -m 755 "$tmp"/lazyvim-*/lazyvim ~/.local/bin/lazyvim
+curl -fL https://github.com/rozsazoltan/lazyvim/releases/latest/download/lazyvim-macos-x86_64 -o ~/.local/bin/lazyvim
+chmod +x ~/.local/bin/lazyvim
 ```
 
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/rozsazoltan/lazyvim/releases/latest/download/lazyvim-windows-x86_64.zip -OutFile lazyvim.zip
-Expand-Archive .\lazyvim.zip -DestinationPath .\lazyvim -Force
+$bin = "$env:LOCALAPPDATA\Programs\lazyvim\bin"
+New-Item -ItemType Directory -Force $bin | Out-Null
+Invoke-WebRequest https://github.com/rozsazoltan/lazyvim/releases/latest/download/lazyvim-windows-x86_64.exe -OutFile "$bin\lazyvim.exe"
 ```
 
-Then add the extracted directory to `PATH`, or move `lazyvim.exe` to a directory that is already in `PATH`.
+Then add `%LOCALAPPDATA%\Programs\lazyvim\bin` to your user `PATH` if it is not already there.
 
 > [!IMPORTANT]
-> Release packages may include a bundled Neovim runtime depending on how the release was built. If Neovim is not bundled, `nvim` must be available from your system `PATH` or configured with `LAZYVIM_NVIM`.
+> The release asset is the `lazyvim` launcher executable. It manages the portable LazyVim home, but it still starts Neovim. Install Neovim normally, put `nvim` in `~/.lazyvim/bin`, or set `LAZYVIM_NVIM` if the launcher cannot find it.
+
+Release checksums are published as `SHA256SUMS` next to the executables.
 
 ### First run
 
@@ -140,7 +137,7 @@ lazyvim update    # update plugins
 lazyvim clean     # remove unused plugins
 ```
 
-These commands run Lazy.nvim in headless mode and use the same portable home as normal editor sessions.
+These commands run lazy.nvim in headless mode and use the same portable home as normal editor sessions.
 
 ### Portable home
 
@@ -182,12 +179,12 @@ lazyvim reset --yes
 The launcher looks for Neovim in this order:
 
 1. `LAZYVIM_NVIM`
-2. `nvim/bin/nvim` next to the launcher package
-3. `bin/nvim` next to the launcher package
+2. `nvim/bin/nvim` next to the launcher executable
+3. `bin/nvim` next to the launcher executable
 4. `~/.lazyvim/bin/nvim`
 5. `nvim` from `PATH`
 
-This lets release packages use bundled Neovim while still allowing advanced users to point to their own binary.
+This keeps the release itself as a single executable while still allowing custom or manually bundled Neovim layouts.
 
 ### Environment variables
 

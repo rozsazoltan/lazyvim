@@ -381,7 +381,7 @@ fn print_locations(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> 
     println!("nvim:        {}", runtime.nvim.display());
 
     if let Some(exe_dir) = &runtime.exe_dir {
-        println!("package:     {}", exe_dir.display());
+        println!("launcher:    {}", exe_dir.display());
     }
 
     Ok(())

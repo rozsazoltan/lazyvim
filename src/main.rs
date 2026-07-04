@@ -11,6 +11,9 @@ const DEFAULT_HOME_DIR: &str = ".lazyvim";
 const STARTER_REPOSITORY: &str = "https://github.com/LazyVim/starter.git";
 const ZIG_VERSION: &str = "0.14.0";
 const TREE_SITTER_VERSION: &str = "0.26.10";
+const RIPGREP_VERSION: &str = "15.1.0";
+const FD_VERSION: &str = "10.4.2";
+const LAZYGIT_VERSION: &str = "0.62.2";
 
 #[derive(Debug)]
 struct Cli {
@@ -30,6 +33,7 @@ enum CliCommand {
     Clean,
     InstallNvim,
     InstallTools,
+    InstallDeps,
     Reset { yes: bool },
     Help,
     Version,
@@ -93,6 +97,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 CliCommand::Clean => run_lazy_command(&runtime, "clean"),
                 CliCommand::InstallNvim => install_neovim_command(&runtime),
                 CliCommand::InstallTools => install_tools_command(&runtime),
+                CliCommand::InstallDeps => install_deps_command(&runtime),
                 CliCommand::Help | CliCommand::Version | CliCommand::Reset { .. } => unreachable!(),
             }
         }
@@ -140,6 +145,7 @@ fn parse_cli(mut args: Vec<String>) -> Cli {
         Some("clean") => CliCommand::Clean,
         Some("install-nvim") => CliCommand::InstallNvim,
         Some("install-tools") => CliCommand::InstallTools,
+        Some("install-deps") => CliCommand::InstallDeps,
         Some("reset") => CliCommand::Reset {
             yes: args.iter().any(|arg| arg == "--yes" || arg == "-y"),
         },
@@ -188,6 +194,8 @@ fn prepare_runtime(
     let mut nvim = resolve_nvim(&home, exe_dir.as_deref());
 
     if bootstrap {
+        ensure_system_dependencies(&path_value)?;
+
         if !command_runs(&nvim, &["--version"], Some(&path_value)) {
             install_neovim(&home)?;
             nvim = resolve_nvim(&home, exe_dir.as_deref());
@@ -404,6 +412,278 @@ fn user_home_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     }
 }
 
+
+fn ensure_system_dependencies(path_value: &OsString) -> Result<(), Box<dyn std::error::Error>> {
+    let mut missing = Vec::new();
+
+    for command in required_system_commands() {
+        if !command_available(command, path_value) {
+            missing.push(command.to_string());
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    println!("Missing system dependencies: {}", missing.join(", "));
+    install_system_dependencies(&missing)?;
+
+    let still_missing: Vec<_> = required_system_commands()
+        .iter()
+        .filter(|command| !command_available(command, path_value))
+        .map(|command| command.to_string())
+        .collect();
+
+    if still_missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "missing required system dependencies after install attempt: {}",
+            still_missing.join(", ")
+        )
+        .into())
+    }
+}
+
+fn required_system_commands() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["git", "powershell"]
+    } else {
+        &["git", "curl", "tar", "unzip"]
+    }
+}
+
+fn command_available(command_name: &str, path_value: &OsString) -> bool {
+    let mut command = Command::new(command_name);
+    command
+        .args(command_probe_args(command_name))
+        .env("PATH", path_value)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    command.status().is_ok()
+}
+
+fn install_system_dependencies(missing: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if cfg!(windows) {
+        return install_windows_system_dependencies(missing);
+    }
+
+    if cfg!(target_os = "macos") {
+        return install_macos_system_dependencies(missing);
+    }
+
+    if cfg!(target_os = "linux") {
+        return install_linux_system_dependencies();
+    }
+
+    Err(format!("automatic dependency installation is not supported on this platform; missing: {}", missing.join(", ")).into())
+}
+
+fn install_windows_system_dependencies(missing: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if !missing.iter().any(|name| name == "git") {
+        return Ok(());
+    }
+
+    if !command_available_without_path("winget") {
+        return Err("Git is required, but it was not found and winget is not available. Install Git for Windows and run lazyvim again.".into());
+    }
+
+    println!("Installing Git for Windows with winget");
+    let status = Command::new("winget")
+        .args([
+            "install",
+            "--id",
+            "Git.Git",
+            "--exact",
+            "--source",
+            "winget",
+            "--silent",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+        ])
+        .status()?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("winget failed to install Git for Windows: {status}").into())
+    }
+}
+
+fn install_macos_system_dependencies(missing: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if command_available_without_path("brew") {
+        let mut packages = Vec::new();
+        if missing.iter().any(|name| name == "git") {
+            packages.push("git");
+        }
+        if missing.iter().any(|name| name == "curl") {
+            packages.push("curl");
+        }
+        if packages.is_empty() {
+            return Ok(());
+        }
+
+        let status = Command::new("brew").arg("install").args(packages).status()?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(format!("brew failed to install missing dependencies: {status}").into());
+    }
+
+    if missing.iter().any(|name| name == "git") {
+        let _ = Command::new("xcode-select").arg("--install").status();
+    }
+
+    Err(format!(
+        "missing macOS dependencies: {}. Install Xcode Command Line Tools or Homebrew, then run lazyvim again.",
+        missing.join(", ")
+    )
+    .into())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxDistro {
+    Alpine,
+    Debian,
+    Arch,
+    Fedora,
+    AmazonLinux,
+    Rhel,
+    Unknown,
+}
+
+fn install_linux_system_dependencies() -> Result<(), Box<dyn std::error::Error>> {
+    let distro = detect_linux_distro();
+    let command = match distro {
+        LinuxDistro::Alpine => "apk add --no-cache git curl ca-certificates tar unzip xz tree-sitter-cli",
+        LinuxDistro::Debian => "apt-get update && apt-get install -y git curl ca-certificates tar unzip xz-utils",
+        LinuxDistro::Arch => "pacman -Sy --noconfirm --needed git curl ca-certificates tar unzip xz tree-sitter-cli",
+        LinuxDistro::Fedora => "dnf install -y git curl ca-certificates tar unzip xz tree-sitter-cli",
+        LinuxDistro::AmazonLinux | LinuxDistro::Rhel => {
+            if command_available_without_path("dnf") {
+                "dnf install -y git curl ca-certificates tar unzip xz tree-sitter-cli"
+            } else {
+                "yum install -y git curl ca-certificates tar unzip xz"
+            }
+        }
+        LinuxDistro::Unknown => {
+            return Err("could not detect a supported Linux distribution for dependency installation".into());
+        }
+    };
+
+    run_privileged_shell(command)
+}
+
+fn install_tree_sitter_from_system_package(path_value: &OsString) -> Result<(), Box<dyn std::error::Error>> {
+    if command_available("tree-sitter", path_value) {
+        return Ok(());
+    }
+
+    match detect_linux_distro() {
+        LinuxDistro::Alpine => run_privileged_shell("apk add --no-cache tree-sitter-cli"),
+        LinuxDistro::Arch => run_privileged_shell("pacman -Sy --noconfirm --needed tree-sitter-cli"),
+        LinuxDistro::Fedora => run_privileged_shell("dnf install -y tree-sitter-cli"),
+        LinuxDistro::Rhel | LinuxDistro::AmazonLinux => {
+            if command_available_without_path("dnf") {
+                run_privileged_shell("dnf install -y tree-sitter-cli")
+            } else {
+                Err("tree-sitter-cli package is not available through yum on this platform".into())
+            }
+        }
+        LinuxDistro::Debian | LinuxDistro::Unknown => Err("tree-sitter-cli system package is not available for this distro".into()),
+    }
+}
+
+fn detect_linux_distro() -> LinuxDistro {
+    if Path::new("/etc/alpine-release").exists() {
+        return LinuxDistro::Alpine;
+    }
+    if Path::new("/etc/debian_version").exists() {
+        return LinuxDistro::Debian;
+    }
+    if Path::new("/etc/arch-release").exists() {
+        return LinuxDistro::Arch;
+    }
+
+    if let Ok(os_release) = fs::read_to_string("/etc/os-release") {
+        let id = os_release_value(&os_release, "ID").unwrap_or_default();
+        let id_like = os_release_value(&os_release, "ID_LIKE").unwrap_or_default();
+        let id_like_words = format!(" {id_like} ");
+
+        return match id.as_str() {
+            "alpine" => LinuxDistro::Alpine,
+            "debian" | "ubuntu" | "linuxmint" | "pop" => LinuxDistro::Debian,
+            "arch" | "manjaro" | "endeavouros" => LinuxDistro::Arch,
+            "fedora" => LinuxDistro::Fedora,
+            "amzn" | "amazonlinux" => LinuxDistro::AmazonLinux,
+            "rhel" | "centos" | "rocky" | "almalinux" | "ol" | "olinux" => LinuxDistro::Rhel,
+            _ if id_like_words.contains(" rhel ") || id_like_words.contains(" fedora ") => LinuxDistro::Rhel,
+            _ if id_like_words.contains(" debian ") => LinuxDistro::Debian,
+            _ if id_like_words.contains(" arch ") => LinuxDistro::Arch,
+            _ => LinuxDistro::Unknown,
+        };
+    }
+
+    if Path::new("/etc/redhat-release").exists() {
+        LinuxDistro::Rhel
+    } else {
+        LinuxDistro::Unknown
+    }
+}
+
+fn os_release_value(contents: &str, key: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let (line_key, value) = line.split_once('=')?;
+        if line_key != key {
+            return None;
+        }
+        Some(value.trim_matches('"').to_string())
+    })
+}
+
+fn run_privileged_shell(command: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Installing system dependencies with: {command}");
+
+    let status = if is_unix_root() {
+        Command::new("sh").arg("-c").arg(command).status()?
+    } else if command_available_without_path("sudo") {
+        Command::new("sudo").arg("sh").arg("-c").arg(command).status()?
+    } else {
+        return Err(format!("missing system dependencies and sudo is not available. Run as root: {command}").into());
+    };
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("system dependency installation failed: {status}").into())
+    }
+}
+
+fn is_unix_root() -> bool {
+    let output = Command::new("id").arg("-u").output();
+    matches!(output, Ok(output) if String::from_utf8_lossy(&output.stdout).trim() == "0")
+}
+
+fn command_available_without_path(command_name: &str) -> bool {
+    let mut command = Command::new(command_name);
+    command
+        .args(command_probe_args(command_name))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    command.status().is_ok()
+}
+
+fn command_probe_args(command_name: &str) -> &'static [&'static str] {
+    match command_name {
+        "powershell" => &["-NoProfile", "-Command", "exit 0"],
+        "sh" => &["-c", "exit 0"],
+        _ => &["--version"],
+    }
+}
+
 fn ensure_starter_config(config_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if config_dir.join("init.lua").exists() {
         return Ok(());
@@ -492,6 +772,17 @@ fn build_path(home: &Path, exe_dir: Option<&Path>) -> io::Result<OsString> {
     paths.push(home.join("tools").join("zig"));
     paths.push(home.join("bin"));
 
+    if cfg!(windows) {
+        paths.push(PathBuf::from(r"C:\Program Files\Git\cmd"));
+        paths.push(PathBuf::from(r"C:\Program Files\Git\bin"));
+        paths.push(PathBuf::from(r"C:\Program Files\Git\usr\bin"));
+    }
+
+    if cfg!(target_os = "macos") {
+        paths.push(PathBuf::from("/opt/homebrew/bin"));
+        paths.push(PathBuf::from("/usr/local/bin"));
+    }
+
     if let Some(exe_dir) = exe_dir {
         paths.push(exe_dir.join("nvim").join("bin"));
         paths.push(exe_dir.join("tools").join("zig"));
@@ -505,6 +796,13 @@ fn build_path(home: &Path, exe_dir: Option<&Path>) -> io::Result<OsString> {
     env::join_paths(paths).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
+
+fn install_deps_command(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_system_dependencies(&runtime.path_value)?;
+    ensure_managed_tools(&runtime.home, &runtime.path_value)?;
+    println!("Installed LazyVim dependencies into {}", runtime.home.display());
+    Ok(())
+}
 
 fn install_tools_command(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
     ensure_managed_tools(&runtime.home, &runtime.path_value)?;
@@ -540,10 +838,53 @@ fn ensure_managed_tools(home: &Path, path_value: &OsString) -> Result<(), Box<dy
     if !command_runs(&zig, &["version"], Some(path_value)) {
         install_zig(home)?;
     }
+    install_c_compiler_wrappers(home)?;
 
     let tree_sitter = tree_sitter_executable_path(home);
     if !command_runs(&tree_sitter, &["--version"], Some(path_value)) {
-        install_tree_sitter(home)?;
+        install_tree_sitter(home, path_value)?;
+    }
+
+    let rg = managed_tool_path(home, if cfg!(windows) { "rg.exe" } else { "rg" });
+    if !command_runs(&rg, &["--version"], Some(path_value)) {
+        install_ripgrep(home)?;
+    }
+
+    let fd = managed_tool_path(home, if cfg!(windows) { "fd.exe" } else { "fd" });
+    if !command_runs(&fd, &["--version"], Some(path_value)) {
+        install_fd(home)?;
+    }
+
+    let lazygit = managed_tool_path(home, if cfg!(windows) { "lazygit.exe" } else { "lazygit" });
+    if !command_runs(&lazygit, &["--version"], Some(path_value)) {
+        install_lazygit(home)?;
+    }
+
+    Ok(())
+}
+
+fn managed_tool_path(home: &Path, executable_name: &str) -> PathBuf {
+    home.join("bin").join(executable_name)
+}
+
+fn install_c_compiler_wrappers(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let bin_dir = home.join("bin");
+    fs::create_dir_all(&bin_dir)?;
+    let zig = zig_executable_path(home);
+
+    if cfg!(windows) {
+        for name in ["cc.cmd", "gcc.cmd", "clang.cmd", "cc.bat", "gcc.bat", "clang.bat"] {
+            let wrapper = bin_dir.join(name);
+            let content = format!("@echo off\r\n\"{}\" cc %*\r\n", zig.display());
+            fs::write(wrapper, content)?;
+        }
+    } else {
+        for name in ["cc", "gcc", "clang"] {
+            let wrapper = bin_dir.join(name);
+            let content = format!("#!/bin/sh\nexec \"{}\" cc \"$@\"\n", zig.display());
+            fs::write(&wrapper, content)?;
+            make_executable(&wrapper)?;
+        }
     }
 
     Ok(())
@@ -555,6 +896,157 @@ fn zig_executable_path(home: &Path) -> PathBuf {
 
 fn tree_sitter_executable_path(home: &Path) -> PathBuf {
     home.join("bin").join(if cfg!(windows) { "tree-sitter.exe" } else { "tree-sitter" })
+}
+
+
+fn install_ripgrep(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let asset = ripgrep_release_asset()?;
+    let url = format!("https://github.com/BurntSushi/ripgrep/releases/download/{RIPGREP_VERSION}/{asset}");
+    install_single_binary_from_archive(home, "ripgrep", &url, &asset, if cfg!(windows) { "rg.exe" } else { "rg" })
+}
+
+fn ripgrep_release_asset() -> Result<String, Box<dyn std::error::Error>> {
+    if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+        return Ok(format!("ripgrep-{RIPGREP_VERSION}-x86_64-pc-windows-msvc.zip"));
+    }
+    if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+        return Ok(format!("ripgrep-{RIPGREP_VERSION}-x86_64-unknown-linux-musl.tar.gz"));
+    }
+    if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+        return Ok(format!("ripgrep-{RIPGREP_VERSION}-x86_64-apple-darwin.tar.gz"));
+    }
+    if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        return Ok(format!("ripgrep-{RIPGREP_VERSION}-aarch64-apple-darwin.tar.gz"));
+    }
+    Err("automatic ripgrep installation is not supported on this platform".into())
+}
+
+fn install_fd(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let asset = fd_release_asset()?;
+    let url = format!("https://github.com/sharkdp/fd/releases/download/v{FD_VERSION}/{asset}");
+    install_single_binary_from_archive(home, "fd", &url, &asset, if cfg!(windows) { "fd.exe" } else { "fd" })
+}
+
+fn fd_release_asset() -> Result<String, Box<dyn std::error::Error>> {
+    if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+        return Ok(format!("fd-v{FD_VERSION}-x86_64-pc-windows-msvc.zip"));
+    }
+    if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+        return Ok(format!("fd-v{FD_VERSION}-x86_64-unknown-linux-musl.tar.gz"));
+    }
+    if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+        return Ok(format!("fd-v{FD_VERSION}-x86_64-apple-darwin.tar.gz"));
+    }
+    if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        return Ok(format!("fd-v{FD_VERSION}-aarch64-apple-darwin.tar.gz"));
+    }
+    Err("automatic fd installation is not supported on this platform".into())
+}
+
+fn install_lazygit(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let asset = lazygit_release_asset()?;
+    let url = format!("https://github.com/jesseduffield/lazygit/releases/download/v{LAZYGIT_VERSION}/{asset}");
+    install_single_binary_from_archive(home, "lazygit", &url, &asset, if cfg!(windows) { "lazygit.exe" } else { "lazygit" })
+}
+
+fn lazygit_release_asset() -> Result<String, Box<dyn std::error::Error>> {
+    if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+        return Ok(format!("lazygit_{LAZYGIT_VERSION}_windows_x86_64.zip"));
+    }
+    if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+        return Ok(format!("lazygit_{LAZYGIT_VERSION}_linux_x86_64.tar.gz"));
+    }
+    if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+        return Ok(format!("lazygit_{LAZYGIT_VERSION}_darwin_x86_64.tar.gz"));
+    }
+    if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        return Ok(format!("lazygit_{LAZYGIT_VERSION}_darwin_arm64.tar.gz"));
+    }
+    Err("automatic lazygit installation is not supported on this platform".into())
+}
+
+fn install_single_binary_from_archive(
+    home: &Path,
+    label: &str,
+    url: &str,
+    asset: &str,
+    executable_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let downloads_dir = home.join("downloads");
+    let archive_path = downloads_dir.join(asset);
+    let temp_dir = home.join(format!(".{label}-install"));
+    let destination = managed_tool_path(home, executable_name);
+
+    fs::create_dir_all(&downloads_dir)?;
+    println!("{label} was not found. Downloading {url}");
+    download_file(url, &archive_path)?;
+    extract_single_tool_archive(&archive_path, &temp_dir, &destination, executable_name)?;
+    make_executable(&destination)?;
+    Ok(())
+}
+
+fn extract_single_tool_archive(
+    archive_path: &Path,
+    temp_dir: &Path,
+    destination: &Path,
+    executable_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if temp_dir.exists() {
+        fs::remove_dir_all(temp_dir)?;
+    }
+    fs::create_dir_all(temp_dir)?;
+
+    if archive_path.extension().and_then(|value| value.to_str()) == Some("zip") {
+        extract_zip_archive(archive_path, temp_dir)?;
+    } else {
+        let status = Command::new("tar")
+            .arg("-xzf")
+            .arg(archive_path)
+            .arg("-C")
+            .arg(temp_dir)
+            .status()?;
+        if !status.success() {
+            return Err(format!("failed to extract {}: tar exited with {status}", archive_path.display()).into());
+        }
+    }
+
+    let source = find_extracted_tool(temp_dir, executable_name)?;
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(&source, destination)?;
+
+    if temp_dir.exists() {
+        fs::remove_dir_all(temp_dir)?;
+    }
+
+    Ok(())
+}
+
+fn extract_zip_archive(archive_path: &Path, temp_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if cfg!(windows) {
+        let script = r#"
+$ErrorActionPreference = 'Stop'
+$archive = $env:LAZYVIM_ZIP_ARCHIVE
+$temp = $env:LAZYVIM_ZIP_TEMP
+Expand-Archive -LiteralPath $archive -DestinationPath $temp -Force
+"#;
+        let status = Command::new("powershell")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-Command")
+            .arg(script)
+            .env("LAZYVIM_ZIP_ARCHIVE", archive_path)
+            .env("LAZYVIM_ZIP_TEMP", temp_dir)
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(format!("failed to extract {}: PowerShell exited with {status}", archive_path.display()).into());
+    }
+
+    extract_zip_with_available_tool(archive_path, temp_dir).map(|_| ())
 }
 
 fn install_zig(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -594,7 +1086,7 @@ fn zig_release_asset() -> Result<String, Box<dyn std::error::Error>> {
     Err("automatic Zig installation is not supported on this platform".into())
 }
 
-fn install_tree_sitter(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn install_tree_sitter(home: &Path, path_value: &OsString) -> Result<(), Box<dyn std::error::Error>> {
     let asset = tree_sitter_release_asset()?;
     let url = format!("https://github.com/tree-sitter/tree-sitter/releases/download/v{TREE_SITTER_VERSION}/{asset}");
     let downloads_dir = home.join("downloads");
@@ -603,6 +1095,15 @@ fn install_tree_sitter(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let destination = tree_sitter_executable_path(home);
 
     fs::create_dir_all(&downloads_dir)?;
+
+    if cfg!(target_os = "linux")
+        && install_tree_sitter_from_system_package(path_value).is_ok()
+        && (command_runs(&destination, &["--version"], Some(path_value))
+            || command_runs(Path::new("tree-sitter"), &["--version"], Some(path_value)))
+    {
+        return Ok(());
+    }
+
     println!("tree-sitter CLI was not found. Downloading tree-sitter {TREE_SITTER_VERSION} from {url}");
     download_file(&url, &archive_path)?;
     extract_tree_sitter_archive(&archive_path, &temp_dir, &destination)?;
@@ -848,7 +1349,7 @@ fn neovim_release_asset() -> Result<&'static str, Box<dyn std::error::Error>> {
 }
 
 fn download_file(url: &str, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let status = Command::new("curl")
+    let curl = Command::new("curl")
         .arg("-fL")
         .arg("--retry")
         .arg("3")
@@ -857,10 +1358,44 @@ fn download_file(url: &str, destination: &Path) -> Result<(), Box<dyn std::error
         .arg(url)
         .status();
 
-    match status {
-        Ok(status) if status.success() => Ok(()),
+    if matches!(curl, Ok(status) if status.success()) {
+        return Ok(());
+    }
+
+    if cfg!(windows) {
+        return download_file_with_powershell(url, destination);
+    }
+
+    match curl {
         Ok(status) => Err(format!("failed to download {url}: curl exited with {status}").into()),
         Err(error) => Err(format!("failed to download {url}: curl is required but could not be started: {error}").into()),
+    }
+}
+
+fn download_file_with_powershell(url: &str, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$url = $env:LAZYVIM_DOWNLOAD_URL
+$dest = $env:LAZYVIM_DOWNLOAD_DEST
+$parent = Split-Path -Parent $dest
+New-Item -ItemType Directory -Force -Path $parent | Out-Null
+Invoke-WebRequest -Uri $url -OutFile $dest
+"#;
+
+    let status = Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(script)
+        .env("LAZYVIM_DOWNLOAD_URL", url)
+        .env("LAZYVIM_DOWNLOAD_DEST", destination)
+        .status()?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("failed to download {url}: PowerShell exited with {status}").into())
     }
 }
 
@@ -1039,12 +1574,13 @@ fn doctor(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> {
 
     check_command("nvim", &runtime.nvim, &["--version"], true, Some(&runtime.path_value))?;
     check_command("zig", Path::new("zig"), &["version"], true, Some(&runtime.path_value))?;
+    check_command("cc", Path::new("cc"), &["--version"], true, Some(&runtime.path_value))?;
     check_command("tree-sitter", Path::new("tree-sitter"), &["--version"], true, Some(&runtime.path_value))?;
-    check_path_tool("git", &["--version"], &runtime.path_value)?;
-    check_path_tool("curl", &["--version"], &runtime.path_value)?;
-    check_path_tool("rg", &["--version"], &runtime.path_value)?;
-    check_path_tool("fd", &["--version"], &runtime.path_value)?;
-    check_path_tool("lazygit", &["--version"], &runtime.path_value)?;
+    check_command("git", Path::new("git"), &["--version"], true, Some(&runtime.path_value))?;
+    check_command("curl", Path::new("curl"), &["--version"], true, Some(&runtime.path_value))?;
+    check_command("rg", Path::new("rg"), &["--version"], true, Some(&runtime.path_value))?;
+    check_command("fd", Path::new("fd"), &["--version"], true, Some(&runtime.path_value))?;
+    check_command("lazygit", Path::new("lazygit"), &["--version"], true, Some(&runtime.path_value))?;
 
     Ok(())
 }
@@ -1062,10 +1598,6 @@ fn print_locations(runtime: &Runtime) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     Ok(())
-}
-
-fn check_path_tool(name: &str, args: &[&str], path_value: &OsString) -> Result<(), Box<dyn std::error::Error>> {
-    check_command(name, Path::new(name), args, false, Some(path_value))
 }
 
 fn check_command(label: &str, command_path: &Path, args: &[&str], required: bool, path_value: Option<&OsString>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1123,7 +1655,8 @@ fn print_help() {
     println!("  update     Run Lazy update in headless mode");
     println!("  clean      Run Lazy clean in headless mode");
     println!("  install-nvim  Install Neovim into the portable home");
-    println!("  install-tools Install Zig and tree-sitter into the portable home");
+    println!("  install-tools Install managed portable tools into the portable home");
+    println!("  install-deps  Install system and managed LazyVim dependencies");
     println!("  reset      Delete the portable home directory; requires --yes");
     println!("  help       Print this help");
     println!();
